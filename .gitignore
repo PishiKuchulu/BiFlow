@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+
+# IDE and Editor files
+/.idea/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+
+# Logs and runtime data
+*.log
+data/
+*.tmp
+*.bak
+
+# Build outputs and portable packages
+portable/
+BiFlow-Portable/
+*.zip
+BiFlow.exe
+BiFlow.exe.old*
+
+# C++ Build intermediate artifacts
+cpp/*.obj
+cpp/*.exp
+cpp/*.lib
+cpp/*.pdb

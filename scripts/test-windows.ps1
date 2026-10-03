@@ -1,0 +1,12 @@
+$ErrorActionPreference = 'Stop'
+Write-Host 'PerAppBypass manual runtime verification'
+Write-Host '1. Start a real VPN/tunnel.'
+Write-Host '2. Run PerAppBypass as Administrator.'
+Write-Host '3. Select a physical/direct interface with IPv4 + gateway.'
+Write-Host '4. Add/choose a Win32 application and enable Direct Bypass.'
+Write-Host '5. Create a NEW network connection from the selected app.'
+Write-Host '6. Verify selected app egress via direct interface/public IP.'
+Write-Host '7. Verify a control app remains on the VPN.'
+Write-Host '8. Disable the policy and repeat.'
+Write-Host ''
+Write-Host 'This script intentionally does not print PASS based on API success alone.' -ForegroundColor Yellow

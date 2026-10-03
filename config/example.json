@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "active_profile": null,
+  "profiles": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "name": "Gaming",
+      "enabled": true,
+      "priority": 100,
+      "rules": []
+    }
+  ]
+}
