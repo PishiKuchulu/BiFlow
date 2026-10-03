@@ -9,6 +9,10 @@
 </p>
 
 <p align="center">
+  <a href="README.md">English</a> • <a href="README_FA.md">فارسی</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/PishiKuchulu/BiFlow/actions/workflows/build-release.yml"><img src="https://img.shields.io/github/actions/workflow/status/PishiKuchulu/BiFlow/build-release.yml?branch=main&style=flat-square&logo=github&label=Build" alt="CI Status" /></a>
   <a href="https://github.com/PishiKuchulu/BiFlow/releases"><img src="https://img.shields.io/github/v/release/PishiKuchulu/BiFlow?style=flat-square&color=38bdf8" alt="Release" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-blue?style=flat-square&logo=windows" alt="Platform" />
