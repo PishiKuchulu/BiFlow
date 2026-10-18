@@ -10,6 +10,7 @@ mod windows;
 
 use app::AppState;
 use eframe::egui;
+use enforcement::BypassLiveStatus;
 use std::time::Duration;
 use uuid::Uuid;
 use windows::tray::BiFlowTray;
@@ -19,11 +20,10 @@ fn main() -> eframe::Result<()> {
         panic!("BiFlow is Windows-only");
     }
 
-    // BiFlow requires Administrator privileges for real Windows Defender Firewall and network packet filtering
+    // BiFlow requires Administrator privileges for real Windows Defender Firewall and network packet filtering.
+    // On success this function never returns (the elevated copy takes over).
     if !windows::privilege::is_elevated() {
-        if windows::privilege::restart_as_administrator().is_ok() {
-            return Ok(());
-        }
+        let _ = windows::privilege::restart_as_administrator();
     }
 
     // Enable SeDebugPrivilege to query process paths and network endpoints across all sessions
@@ -143,7 +143,8 @@ impl BiFlowApp {
     }
 
     fn check_tray_and_window_state(&mut self, ctx: &egui::Context) {
-        ctx.request_repaint_after(Duration::from_millis(150));
+        // Periodic repaint drives the watchdog and tray-state handling.
+        ctx.request_repaint_after(Duration::from_millis(500));
 
         // 1. Handle Restore Request from Tray (fired immediately by Windows callback)
         if windows::tray::take_restore_requested() {
@@ -604,7 +605,8 @@ impl BiFlowApp {
                     let is_running = self.state.is_app_running(app);
                     let has_net = self.state.has_active_network(app);
                     let is_bypassed = self.state.is_app_bypassed(app.id);
-                    let is_live = self.state.manager.is_active(app.id);
+                    let live_status = self.state.manager.live_status(app.id);
+                    let inject_error = self.state.manager.inject_error(app.id);
                     let is_blocked = self.state.is_app_blocked(app.id);
 
                     if self.state.filter_running_only && !is_running {
@@ -702,17 +704,39 @@ impl BiFlowApp {
                                 }
 
                                 if is_bypassed {
-                                    let pill_text = if is_live {
-                                        "⚡ BYPASSING VPN"
-                                    } else {
-                                        "⚡ BYPASS CONFIGURED"
+                                    // Honest status: only claim a live bypass when the
+                                    // hook DLL is actually inside the target process.
+                                    let (pill_text, pill_color, hover) = match live_status {
+                                        Some(BypassLiveStatus::Live) => (
+                                            "⚡ BYPASSING VPN",
+                                            egui::Color32::from_rgb(52, 211, 153),
+                                            "Hook is active: new connections bypass the VPN via the direct adapter.",
+                                        ),
+                                        Some(BypassLiveStatus::Pending) => (
+                                            "⚡ BYPASS CONFIGURED",
+                                            egui::Color32::from_rgb(52, 211, 153),
+                                            "Configured. The bypass activates automatically when the app starts.",
+                                        ),
+                                        Some(BypassLiveStatus::Failed) => (
+                                            "⚠ BYPASS FAILED",
+                                            egui::Color32::from_rgb(248, 113, 113),
+                                            inject_error.as_deref().unwrap_or(
+                                                "DLL injection failed for the running process.",
+                                            ),
+                                        ),
+                                        None => (
+                                            "⚡ BYPASS CONFIGURED",
+                                            egui::Color32::from_rgb(148, 163, 184),
+                                            "Saved in the active profile.",
+                                        ),
                                     };
                                     ui.label(
                                         egui::RichText::new(pill_text)
                                             .size(11.0)
                                             .strong()
-                                            .color(egui::Color32::from_rgb(52, 211, 153)),
-                                    );
+                                            .color(pill_color),
+                                    )
+                                    .on_hover_text(hover);
                                 }
                             }
 
@@ -1250,7 +1274,7 @@ impl BiFlowApp {
                     .size(14.0)
                     .color(egui::Color32::from_rgb(56, 189, 248)),
             );
-            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.2.0");
+            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.2.1");
             ui.label(format!(
                 "Configuration path: {}",
                 config::store_path().display()

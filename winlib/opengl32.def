@@ -1,6 +1,0 @@
-LIBRARY OPENGL32.DLL
-EXPORTS
-    wglCreateContext
-    wglDeleteContext
-    wglGetProcAddress
-    wglMakeCurrent

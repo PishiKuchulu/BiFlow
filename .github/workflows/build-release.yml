@@ -34,6 +34,14 @@ jobs:
       - name: Run Unit Tests
         run: cargo test --verbose
 
+      - name: Rebuild hook DLL from source
+        shell: powershell
+        # Never ship a stale prebuilt binary: always compile the hook DLL
+        # from the C source in this tree with MSVC.
+        run: |
+          Remove-Item -Path "cpp/biflow_hook64.dll" -Force -ErrorAction SilentlyContinue
+          if (Test-Path "cpp/biflow_hook64.dll") { throw "Could not remove stale hook DLL" }
+
       - name: Build Release Binary
         run: cargo build --release
 

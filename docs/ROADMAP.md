@@ -1,7 +1,7 @@
 # Roadmap
 
 ## Phase 1 — Core IPv4 process routing
-- WFP connection policy
+- Winsock hook policy (done: `connect`/`WSAConnect`/`sendto`/`WSASendTo`/`bind`)
 - interface/gateway selection
 - profile persistence
 - safe cleanup

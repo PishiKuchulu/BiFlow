@@ -2,18 +2,33 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot\..
 
 $root = (Get-Location).Path
-$winlib = Join-Path $root 'winlib'
-$msvcBin = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64'
-$msvcLib = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\x64'
 $cargoBin = "$env:USERPROFILE\.cargo\bin"
 
-if (Test-Path $winlib) {
-    $env:LIB = "$winlib;$msvcLib;" + $env:LIB
+# Locate MSVC Build Tools via vswhere (no hardcoded VS version/path).
+$msvcBin = $null
+$msvcLib = $null
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path $vswhere) {
+    $installPath = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath 2>$null
+    if ($installPath) {
+        $vcTools = Get-ChildItem "$installPath\VC\Tools\MSVC" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($vcTools) {
+            $msvcBin = "$($vcTools.FullName)\bin\Hostx64\x64"
+            $msvcLib = "$($vcTools.FullName)\lib\x64"
+        }
+    }
 }
-$env:PATH = "$msvcBin;$cargoBin;" + $env:PATH
+if ($msvcBin -and (Test-Path $msvcBin)) { $env:PATH = "$msvcBin;" + $env:PATH }
+if ($msvcLib -and (Test-Path $msvcLib)) { $env:LIB = "$msvcLib;" + $env:LIB }
+$env:PATH = "$cargoBin;" + $env:PATH
 
 cargo test
+if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
 cargo build --release
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
 $candidates = @(
     (Join-Path $root 'target\x86_64-pc-windows-msvc\release\biflow.exe'),
@@ -34,4 +49,3 @@ catch {
 Get-ChildItem -Path $root -Filter 'BiFlow.exe.old*' | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 
 Write-Host "BUILD SUCCESS: BiFlow.exe created at root ($exe)" -ForegroundColor Green
-

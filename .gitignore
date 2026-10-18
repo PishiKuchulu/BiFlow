@@ -26,3 +26,5 @@ cpp/*.obj
 cpp/*.exp
 cpp/*.lib
 cpp/*.pdb
+# Hook DLL is always rebuilt from source by build.rs; never commit the binary
+cpp/biflow_hook64.dll

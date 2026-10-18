@@ -2,6 +2,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=cpp/biflow_hook.c");
+    println!("cargo:rerun-if-changed=cpp/minhook/include/MinHook.h");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=assets/biflow.ico");
     println!("cargo:rerun-if-changed=assets/biflow_res.obj");

@@ -130,6 +130,16 @@ BiFlow.exe
 
 ---
 
+## ⚠️ Honest Limitations
+
+- **IPv4 only:** the bypass hook covers IPv4 sockets (`connect`, `WSAConnect`, `sendto`, `WSASendTo`, `bind`). IPv6 traffic of a bypassed app still follows the system/VPN route.
+- **New connections only:** enabling, disabling, or switching a bypass affects *new* sockets. Already-established connections are never migrated — restart the app for a fully clean state.
+- **Chromium browsers:** "Launch Direct" on Chrome/Edge/Brave adds `--disable-features=RendererCodeIntegrity --no-proxy-server` (required for the hook to load). This weakens the browser sandbox's code-integrity check for that instance.
+- **64-bit only:** 32-bit (WOW64) processes are detected and skipped.
+- A VPN kill-switch that blocks direct egress will still block bypassed traffic — BiFlow does not circumvent it. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+
+---
+
 ## 🤝 Contributing
 
 Contributions, bug reports, and feature suggestions are very welcome!

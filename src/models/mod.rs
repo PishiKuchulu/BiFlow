@@ -113,3 +113,30 @@ pub enum EnforcementStatus {
     Applied,
     Failed(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_store_has_single_default_profile() {
+        let s = Store::default();
+        assert_eq!(s.profiles.len(), 1);
+        assert_eq!(s.profiles[0].name, "Default");
+        assert_eq!(s.active_profile, Some(s.profiles[0].id));
+        assert!(s.minimize_to_tray);
+        assert!(s.close_to_tray);
+    }
+
+    #[test]
+    fn bypass_rule_serialization_is_stable() {
+        let rule = BypassRule {
+            app_id: Uuid::nil(),
+            enabled: true,
+            exe_path: Some("C:\\App\\app.exe".into()),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: BypassRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, back);
+    }
+}

@@ -595,9 +595,19 @@ impl AppState {
         match self.manager.launch(app_id, &exe_path, &direct) {
             Ok(pid) => {
                 self.update_active_profile_rule(app_id, true);
+                // Honest disclosure: hooking Chromium requires disabling its
+                // renderer code integrity and ignoring the system proxy.
+                let chromium_note = {
+                    let n = app.executable.to_ascii_lowercase();
+                    if n.contains("chrome") || n.contains("msedge") || n.contains("brave") {
+                        " Note: launched with RendererCodeIntegrity disabled and --no-proxy-server (required for hooking)."
+                    } else {
+                        ""
+                    }
+                };
                 self.status = format!(
-                    "Launched {} (PID: {}) directly bypassing VPN via {}!",
-                    app.name, pid, direct.name
+                    "Launched {} (PID: {}) directly bypassing VPN via {}!{}",
+                    app.name, pid, direct.name, chromium_note
                 );
             }
             Err(e) => {

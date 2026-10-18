@@ -174,3 +174,24 @@ pub fn discover_running_processes() -> Vec<AppEntry> {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_id_is_deterministic_and_case_insensitive() {
+        let a = generate_app_id("C:\\Program Files\\App\\app.exe");
+        let b = generate_app_id("c:\\program files\\app\\app.exe");
+        assert_eq!(a, b, "same path in different case must map to one id");
+        let c = generate_app_id("C:\\Program Files\\Other\\app.exe");
+        assert_ne!(a, c, "different paths must map to different ids");
+    }
+
+    #[test]
+    fn app_id_trims_quotes_and_whitespace() {
+        let a = generate_app_id("\"C:\\App\\app.exe\"");
+        let b = generate_app_id("  C:\\App\\app.exe  ");
+        assert_eq!(a, b);
+    }
+}

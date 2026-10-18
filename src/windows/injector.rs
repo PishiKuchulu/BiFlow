@@ -30,28 +30,65 @@ pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
     Ok(dll_path)
 }
 
-pub fn update_target_ip(ip: &str, _if_index: u32) -> Result<(), String> {
+pub fn update_target_ip(ip: &str) -> Result<(), String> {
     let clean = ip.trim();
-    let temp_file = std::env::temp_dir().join("biflow_target_ip.txt");
-    let _ = fs::write(temp_file, clean);
-
-    // Also write to global ProgramData so all processes and sandboxes can read it
-    if let Ok(prog_data) = std::env::var("ProgramData") {
-        let dir = PathBuf::from(prog_data).join("BiFlow");
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(dir.join("target_ip.txt"), clean);
-    }
-
+    write_policy_file(0, clean);
+    write_policy_file(1, clean);
     Ok(())
 }
 
-pub fn clear_target_ip() {
-    let temp_file = std::env::temp_dir().join("biflow_target_ip.txt");
-    let _ = fs::remove_file(temp_file);
+/// Writes the allow-list of bypassed executables (one full path per line).
+/// The injected hook only binds sockets for processes on this list, so
+/// removing one app stops its bypass without affecting the others.
+pub fn update_bypass_app_list(exe_paths: &[String]) {
+    let content = exe_paths.join("\n");
+    write_policy_file(2, &content);
+    write_policy_file(3, &content);
+}
 
-    if let Ok(prog_data) = std::env::var("ProgramData") {
-        let p = PathBuf::from(prog_data).join("BiFlow").join("target_ip.txt");
-        let _ = fs::remove_file(p);
+/// kind: 0 = %TEMP%\biflow_target_ip.txt
+///       1 = %ProgramData%\BiFlow\target_ip.txt
+///       2 = %TEMP%\BiFlow\bypass_apps.txt
+///       3 = %ProgramData%\BiFlow\bypass_apps.txt
+fn write_policy_file(kind: u32, content: &str) {
+    let path: PathBuf = match kind {
+        0 => std::env::temp_dir().join("biflow_target_ip.txt"),
+        2 => std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"),
+        _ => match std::env::var("ProgramData") {
+            Ok(prog_data) => {
+                let leaf = if kind == 1 { "target_ip.txt" } else { "bypass_apps.txt" };
+                PathBuf::from(prog_data).join("BiFlow").join(leaf)
+            }
+            Err(_) => return,
+        },
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, content);
+}
+
+fn remove_policy_file(kind: u32) {
+    let path: PathBuf = match kind {
+        0 => std::env::temp_dir().join("biflow_target_ip.txt"),
+        2 => std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"),
+        _ => match std::env::var("ProgramData") {
+            Ok(prog_data) => {
+                let leaf = if kind == 1 { "target_ip.txt" } else { "bypass_apps.txt" };
+                PathBuf::from(prog_data).join("BiFlow").join(leaf)
+            }
+            Err(_) => return,
+        },
+    };
+    let _ = fs::remove_file(path);
+}
+
+pub fn clear_target_ip() {
+    // Deleting the policy files is the disable signal: the injected hook
+    // re-validates them on every intercepted call and stops binding new
+    // sockets once they are gone.
+    for kind in 0..4 {
+        remove_policy_file(kind);
     }
 }
 
@@ -153,9 +190,9 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn launch_with_bypass(exe: &Path, target_ip: &str, if_index: u32) -> Result<u32, String> {
+pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<u32, String> {
     let dll_path = ensure_dll_extracted()?;
-    update_target_ip(target_ip, if_index)?;
+    update_target_ip(target_ip)?;
 
     let exe_name = exe.file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     let wide_exe: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -236,6 +273,45 @@ pub fn find_pids_by_exe_name(exe_name: &str) -> Vec<u32> {
                 );
                 if name.to_ascii_lowercase() == lower_target {
                     pids.push(entry.th32ProcessID);
+                }
+
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+
+        CloseHandle(snapshot);
+    }
+
+    pids
+}
+
+/// Find PIDs whose full executable path matches `exe` (case-insensitive).
+/// Unlike `find_pids_by_exe_name`, same-name binaries in other folders are
+/// never matched, so injection and connection teardown target the right app.
+pub fn find_pids_by_exe_path(exe: &Path) -> Vec<u32> {
+    let target = exe.to_string_lossy().to_ascii_lowercase();
+    let mut pids = Vec::new();
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return pids;
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid > 4 {
+                    if let Some(path) = get_process_full_path(pid) {
+                        if path.to_ascii_lowercase() == target {
+                            pids.push(pid);
+                        }
+                    }
                 }
 
                 if Process32NextW(snapshot, &mut entry) == 0 {

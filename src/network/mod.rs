@@ -176,6 +176,47 @@ pub fn terminate_tcp_connections_for_pids(target_pids: &HashSet<u32>) {
                 }
             }
         }
+
+        // IPv6 TCP connections (same treatment so the kill-switch is complete)
+        let mut size6 = 0u32;
+        let _ = GetExtendedTcpTable(
+            null_mut(),
+            &mut size6,
+            0,
+            AF_INET6 as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if size6 > 0 {
+            let mut buf = vec![0u8; size6 as usize];
+            if GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut _,
+                &mut size6,
+                0,
+                AF_INET6 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            ) == 0
+            {
+                let table = buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+                let num_entries = (*table).dwNumEntries;
+                let rows =
+                    std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize);
+                for row in rows {
+                    if target_pids.contains(&row.dwOwningPid) {
+                        let mut tcp_row: MIB_TCP6ROW = std::mem::zeroed();
+                        tcp_row.State = MIB_TCP_STATE_DELETE_TCB;
+                        tcp_row.LocalAddr.u.Byte = row.ucLocalAddr;
+                        tcp_row.dwLocalScopeId = row.dwLocalScopeId;
+                        tcp_row.dwLocalPort = row.dwLocalPort;
+                        tcp_row.RemoteAddr.u.Byte = row.ucRemoteAddr;
+                        tcp_row.dwRemoteScopeId = row.dwRemoteScopeId;
+                        tcp_row.dwRemotePort = row.dwRemotePort;
+                        let _ = SetTcpEntry(&tcp_row as *const MIB_TCP6ROW as *const MIB_TCPROW_LH);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -309,4 +350,34 @@ pub fn is_likely_vpn(i: &InterfaceInfo) -> bool {
         "v2ray", "xray", "sing-box", "nekoray", "clash", "hiddify"
     ];
     keywords.iter().any(|k| s.contains(k)) || i.virtual_adapter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iface(name: &str, description: &str, virtual_adapter: bool) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.into(),
+            index: 1,
+            status: "Up".into(),
+            description: description.into(),
+            ipv4: None,
+            gateway: None,
+            virtual_adapter,
+        }
+    }
+
+    #[test]
+    fn vpn_heuristic_detects_tunnels() {
+        assert!(is_likely_vpn(&iface("WireGuard Tunnel", "Wintun Userspace Tunnel", false)));
+        assert!(is_likely_vpn(&iface("Ethernet", "TAP-Windows Adapter V9", false)));
+        assert!(is_likely_vpn(&iface("Local Area Connection", "", true)));
+    }
+
+    #[test]
+    fn vpn_heuristic_keeps_physical_adapters() {
+        assert!(!is_likely_vpn(&iface("Wi-Fi", "Intel(R) Wi-Fi 6 AX201", false)));
+        assert!(!is_likely_vpn(&iface("Ethernet", "Realtek PCIe GbE", false)));
+    }
 }
