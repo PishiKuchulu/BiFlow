@@ -4,25 +4,27 @@ Set-Location $PSScriptRoot\..
 $root = (Get-Location).Path
 $cargoBin = "$env:USERPROFILE\.cargo\bin"
 
-# Locate MSVC Build Tools via vswhere (no hardcoded VS version/path).
-$msvcBin = $null
-$msvcLib = $null
+# Set up the full MSVC build environment (PATH, INCLUDE, LIB, ...) via
+# vcvars64.bat, located through vswhere. No hardcoded VS version/path.
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (Test-Path $vswhere) {
     $installPath = & $vswhere -latest -products * `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
         -property installationPath 2>$null
-    if ($installPath) {
-        $vcTools = Get-ChildItem "$installPath\VC\Tools\MSVC" -Directory |
-            Sort-Object Name -Descending | Select-Object -First 1
-        if ($vcTools) {
-            $msvcBin = "$($vcTools.FullName)\bin\Hostx64\x64"
-            $msvcLib = "$($vcTools.FullName)\lib\x64"
+    $vcvars = if ($installPath) { Join-Path $installPath 'VC\Auxiliary\Build\vcvars64.bat' } else { $null }
+    if ($vcvars -and (Test-Path $vcvars)) {
+        Write-Host "Loading MSVC environment from $vcvars" -ForegroundColor Cyan
+        cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') {
+                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
         }
+    } else {
+        Write-Warning "vcvars64.bat not found; hoping cl.exe/link.exe are already on PATH."
     }
+} else {
+    Write-Warning "vswhere.exe not found; hoping the MSVC toolchain is already on PATH."
 }
-if ($msvcBin -and (Test-Path $msvcBin)) { $env:PATH = "$msvcBin;" + $env:PATH }
-if ($msvcLib -and (Test-Path $msvcLib)) { $env:LIB = "$msvcLib;" + $env:LIB }
 $env:PATH = "$cargoBin;" + $env:PATH
 
 cargo test

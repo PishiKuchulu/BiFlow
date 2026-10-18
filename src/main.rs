@@ -1274,7 +1274,7 @@ impl BiFlowApp {
                     .size(14.0)
                     .color(egui::Color32::from_rgb(56, 189, 248)),
             );
-            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.2.1");
+            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.2.2");
             ui.label(format!(
                 "Configuration path: {}",
                 config::store_path().display()

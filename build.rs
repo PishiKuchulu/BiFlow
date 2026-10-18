@@ -41,6 +41,10 @@ fn main() {
             println!("cargo:warning=Building biflow_hook64.dll from cpp/biflow_hook.c...");
             let tool = cc::Build::new().get_compiler();
             let mut cmd = Command::new(tool.path());
+            // Propagate the cc crate's environment (e.g. VSLANG).
+            for (k, v) in tool.env() {
+                cmd.env(k, v);
+            }
             cmd.args([
                 "/LD", "/O2", "/MD",
                 "/Fe:cpp/biflow_hook64.dll",
@@ -54,10 +58,25 @@ fn main() {
                 "ws2_32.lib",
                 "user32.lib",
             ]);
-            let status = cmd.status();
-            match status {
-                Ok(s) if s.success() => println!("cargo:warning=biflow_hook64.dll built successfully"),
-                _ => println!("cargo:warning=Failed to invoke cl.exe directly, precompiled dll will be used if present"),
+            match cmd.output() {
+                Ok(out) if out.status.success() => {
+                    println!("cargo:warning=biflow_hook64.dll built successfully")
+                }
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    panic!(
+                        "Failed to build biflow_hook64.dll with {} (a working MSVC C++ toolchain with Windows SDK is required):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                        tool.path().display(),
+                        stdout,
+                        stderr
+                    );
+                }
+                Err(e) => panic!(
+                    "Failed to invoke C compiler {}: {}. A working MSVC C++ toolchain is required to build the hook DLL.",
+                    tool.path().display(),
+                    e
+                ),
             }
         }
     }
