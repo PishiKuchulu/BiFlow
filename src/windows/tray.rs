@@ -7,6 +7,7 @@ use tray_icon::{
 
 static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DISABLE_ALL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static EGUI_CTX: Mutex<Option<eframe::egui::Context>> = Mutex::new(None);
 
 pub fn set_egui_context(ctx: eframe::egui::Context) {
@@ -21,6 +22,10 @@ pub fn take_restore_requested() -> bool {
 
 pub fn take_disable_all_requested() -> bool {
     DISABLE_ALL_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+pub fn take_exit_requested() -> bool {
+    EXIT_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 fn trigger_repaint() {
@@ -62,10 +67,14 @@ impl BiFlowTray {
             .map_err(|e| format!("Failed to create system tray icon: {}", e))?;
 
         // 1. Menu click handler: Executes immediately in the Windows message callback!
+        //    It only sets flags: exiting from inside this callback used to
+        //    kill the process with process::exit(0) while the UI thread might
+        //    be halfway through a config save. The main thread polls the
+        //    flags and performs an orderly shutdown itself.
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id == exit_id {
-                crate::windows::injector::clear_target_ip();
-                std::process::exit(0);
+                EXIT_REQUESTED.store(true, Ordering::SeqCst);
+                trigger_repaint();
             } else if event.id == show_id {
                 RESTORE_REQUESTED.store(true, Ordering::SeqCst);
                 crate::windows::bring_window_to_front();

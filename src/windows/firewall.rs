@@ -63,24 +63,12 @@ pub fn block_app(app_id: &Uuid, app_name: &str, exe_path: &str) -> Result<(), St
             }
         }
     } else {
-        // Single UAC prompt for the whole sequence instead of one per command.
-        run_elevated_batch(&script_lines)?;
-
-        if !is_rule_present(app_id) {
-            let ps_add = format!(
-                "Start-Process powershell -ArgumentList '-NoProfile -WindowStyle Hidden -Command \"New-NetFirewallRule -DisplayName ''{0}'' -Direction Outbound -Action Block -Program ''{1}'' -Enabled True; New-NetFirewallRule -DisplayName ''{0}'' -Direction Inbound -Action Block -Program ''{1}'' -Enabled True\"' -Verb RunAs -Wait -WindowStyle Hidden",
-                name,
-                clean_path.replace('\'', "''")
-            );
-            let _ = Command::new("powershell")
-                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_add])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-        }
-
-        if !is_rule_present(app_id) {
-            return Err("Administrator elevation was rejected or failed.".into());
-        }
+        // BiFlow's manifest already requires Administrator, so this branch is
+        // unreachable in practice. It used to write a fixed-name .cmd file
+        // into %TEMP% and run it elevated — a classic TOCTOU privilege
+        // escalation (any same-user process could rewrite the file while the
+        // UAC prompt was up). It now fails honestly instead.
+        return Err("Blocking requires BiFlow to run as Administrator.".into());
     }
 
     // Terminate active TCP connections (IPv4 + IPv6) for this exact executable
@@ -116,6 +104,10 @@ fn run_powershell_block(name: &str, clean_path: &str) {
 pub fn unblock_app(app_id: &Uuid) -> Result<(), String> {
     let name = rule_name(app_id);
 
+    if !crate::windows::privilege::is_elevated() {
+        return Err("Unblocking requires BiFlow to run as Administrator.".into());
+    }
+
     let script_lines = vec![
         format!("netsh advfirewall firewall delete rule name=\"{}\"", name),
         format!(
@@ -124,13 +116,18 @@ pub fn unblock_app(app_id: &Uuid) -> Result<(), String> {
         ),
     ];
 
-    if crate::windows::privilege::is_elevated() {
-        for line in &script_lines {
-            let _ = run_netsh_line(line);
-        }
-    } else {
-        // One UAC prompt for the whole unblock sequence.
-        let _ = run_elevated_batch(&script_lines);
+    for line in &script_lines {
+        let _ = run_netsh_line(line);
+    }
+
+    // Verify the rule is really gone before reporting success: previously
+    // this always returned Ok, so the UI removed the app from the blocked
+    // list while the firewall rule could still be silently in force.
+    if is_rule_present(app_id) {
+        return Err(format!(
+            "Firewall rule {} is still present after the delete attempt",
+            name
+        ));
     }
 
     crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", app_id));
@@ -147,12 +144,16 @@ pub fn is_rule_present(app_id: &Uuid) -> bool {
     }
 }
 
-pub fn clear_all_blocked_rules(app_ids: &[Uuid]) {
+pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
+    if !crate::windows::privilege::is_elevated() {
+        return Err("Clearing firewall rules requires BiFlow to run as Administrator.".into());
+    }
+
     let mut script_lines: Vec<String> = Vec::new();
     for id in app_ids {
         let name = rule_name(id);
         script_lines.push(format!("netsh advfirewall firewall delete rule name=\"{}\"", name));
-        let _ = unblock_app_quiet(id);
+        crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", id));
     }
 
     // Comprehensive purge: remove any orphaned BiFlow rules in one operation.
@@ -160,19 +161,19 @@ pub fn clear_all_blocked_rules(app_ids: &[Uuid]) {
         "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -DisplayName 'BiFlow_Block*' -ErrorAction SilentlyContinue\"".to_string(),
     );
 
-    if crate::windows::privilege::is_elevated() {
-        for line in &script_lines {
-            let _ = run_netsh_line(line);
-        }
-    } else {
-        let _ = run_elevated_batch(&script_lines);
+    for line in &script_lines {
+        let _ = run_netsh_line(line);
     }
-}
 
-/// Quiet per-rule removal used by clear_all_blocked_rules (the batch above
-/// does the real work); only logs.
-fn unblock_app_quiet(app_id: &Uuid) -> Result<(), String> {
-    crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", app_id));
+    // Verify: report failure if any of the rules survived the purge, so the
+    // caller does not clear its own blocked list while Windows still blocks.
+    let remaining: Vec<&Uuid> = app_ids.iter().filter(|id| is_rule_present(id)).collect();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "{} firewall rule(s) could not be removed",
+            remaining.len()
+        ));
+    }
     Ok(())
 }
 
@@ -239,41 +240,6 @@ fn split_cmd_line(line: &str) -> Vec<String> {
     out
 }
 
-/// Run several command lines with a SINGLE UAC elevation prompt by writing
-/// them to a temp .cmd file and executing it elevated.
-fn run_elevated_batch(lines: &[String]) -> Result<(), String> {
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join("biflow_fw_batch.cmd");
-    {
-        let mut f = std::fs::File::create(&path)
-            .map_err(|e| format!("Failed to write batch file: {}", e))?;
-        f.write_all(b"@echo off\r\n")
-            .map_err(|e| e.to_string())?;
-        for line in lines {
-            f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-            f.write_all(b"\r\n").map_err(|e| e.to_string())?;
-        }
-    }
-
-    let ps_cmd = format!(
-        "Start-Process -FilePath '{}' -Verb RunAs -Wait -WindowStyle Hidden",
-        path.display()
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("Failed to request administrator elevation: {}", e))?;
-
-    let _ = std::fs::remove_file(&path);
-
-    if !output.status.success() {
-        return Err("Administrator elevation was rejected or failed.".into());
-    }
-    Ok(())
-}
-
 fn run_netsh(args: &[&str]) -> Result<String, String> {
     if crate::windows::privilege::is_elevated() {
         let output = Command::new("netsh")
@@ -298,35 +264,7 @@ fn run_netsh(args: &[&str]) -> Result<String, String> {
 
         Ok(stdout)
     } else {
-        // Fallback for non-elevated single commands: launch elevated netsh via PowerShell
-        let args_formatted = args
-            .iter()
-            .map(|a| {
-                if a.contains(' ') || a.contains('"') {
-                    format!("`\"{}\"`", a.replace('"', "`\""))
-                } else {
-                    a.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let ps_cmd = format!(
-            "Start-Process netsh -ArgumentList '{}' -Verb RunAs -Wait -WindowStyle Hidden",
-            args_formatted
-        );
-
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Failed to request administrator elevation: {}", e))?;
-
-        if !output.status.success() {
-            return Err("Administrator elevation was rejected or failed.".into());
-        }
-
-        Ok("Success (elevated)".into())
+        Err("netsh requires BiFlow to run as Administrator.".into())
     }
 }
 

@@ -3,53 +3,139 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::LibraryLoader::*;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
-const EMBEDDED_HOOK_DLL: &[u8] = include_bytes!("../../cpp/biflow_hook64.dll");
+const EMBEDDED_HOOK_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/biflow_hook64.dll"));
+
+/// Versioned hook DLL file name, so an updated BiFlow never fights over a
+/// DLL file that is still loaded (and therefore locked) in target processes.
+pub fn hook_dll_file_name() -> String {
+    format!(
+        "biflow_hook64_v{}.dll",
+        env!("CARGO_PKG_VERSION").replace('.', "_")
+    )
+}
+
+static ACL_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// %ProgramData%\BiFlow — the protected home of the hook DLL and the policy
+/// files. On first use its DACL is replaced (best effort) with a protected
+/// one: SYSTEM and Administrators get full control, ordinary users only
+/// read/execute. That is what stops a same-user, non-elevated process from
+/// swapping the DLL or the policy files that the elevated BiFlow later loads
+/// into other processes (local privilege-escalation via %TEMP%).
+pub fn biflow_programdata_dir() -> Option<PathBuf> {
+    let prog = std::env::var("ProgramData").ok()?;
+    let dir = PathBuf::from(prog).join("BiFlow");
+    let _ = fs::create_dir_all(&dir);
+    ACL_ONCE.call_once(|| set_admin_only_acl(&dir));
+    Some(dir)
+}
+
+fn set_admin_only_acl(dir: &Path) {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    // D:P  = protected DACL (no inheritance from the parent folder)
+    // FA   = full access for SYSTEM (SY) and Administrators (BA)
+    // GRGX = generic read/execute for Users (BU)
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut psd: PSECURITY_DESCRIPTOR = null_mut();
+        let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            null_mut(),
+        );
+        if ok != 0 && !psd.is_null() {
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let _ = SetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                psd,
+            );
+            LocalFree(psd as HLOCAL);
+        }
+    }
+}
 
 pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
-    let temp = std::env::temp_dir().join("BiFlow");
-    fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
-    let dll_path = temp.join("biflow_hook64.dll");
+    let base = biflow_programdata_dir()
+        .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?
+        .join("bin");
+    fs::create_dir_all(&base).map_err(|e| format!("Cannot create {}: {}", base.display(), e))?;
+    let dll_path = base.join(hook_dll_file_name());
 
-    // Write if not exists or if size differs
-    let needs_write = match fs::metadata(&dll_path) {
-        Ok(m) => m.len() != EMBEDDED_HOOK_DLL.len() as u64,
-        Err(_) => true,
-    };
+    // Verify the FULL content, not just the size: a same-size impostor DLL
+    // must never be injected. (The directory ACL above is the primary
+    // defense; this catches corruption and stale builds.)
+    let current = fs::read(&dll_path).ok();
+    if current.as_deref() != Some(EMBEDDED_HOOK_DLL) {
+        fs::write(&dll_path, EMBEDDED_HOOK_DLL).map_err(|e| {
+            format!(
+                "Cannot write hook DLL {} (is an old copy still loaded in a target process?): {}",
+                dll_path.display(),
+                e
+            )
+        })?;
+        let back = fs::read(&dll_path)
+            .map_err(|e| format!("Cannot re-read hook DLL {}: {}", dll_path.display(), e))?;
+        if back != EMBEDDED_HOOK_DLL {
+            return Err("Hook DLL content verification failed after writing it".into());
+        }
+    }
 
-    if needs_write {
-        fs::write(&dll_path, EMBEDDED_HOOK_DLL).map_err(|e| e.to_string())?;
+    // Best-effort cleanup of DLLs from older BiFlow versions.
+    if let Ok(entries) = fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("biflow_hook64_v") && entry.path() != dll_path {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     Ok(dll_path)
 }
 
 pub fn update_target_ip(ip: &str) -> Result<(), String> {
+    let _ = biflow_programdata_dir();
     let clean = ip.trim();
     write_policy_file(0, clean);
     write_policy_file(1, clean);
     Ok(())
 }
 
-/// Writes the allow-list of bypassed executables (one full path per line).
-/// The injected hook only binds sockets for processes on this list, so
-/// removing one app stops its bypass without affecting the others.
+/// Writes the allow-list of bypassed executables (one full path per line,
+/// UTF-8). The injected hook only binds sockets for processes on this list,
+/// so removing one app stops its bypass without affecting the others.
 pub fn update_bypass_app_list(exe_paths: &[String]) {
+    let _ = biflow_programdata_dir();
     let content = exe_paths.join("\n");
     write_policy_file(2, &content);
     write_policy_file(3, &content);
 }
 
-/// kind: 0 = %TEMP%\biflow_target_ip.txt
-///       1 = %ProgramData%\BiFlow\target_ip.txt
-///       2 = %TEMP%\BiFlow\bypass_apps.txt
-///       3 = %ProgramData%\BiFlow\bypass_apps.txt
+/// kind: 0 = %TEMP%\biflow_target_ip.txt           (legacy fallback)
+///       1 = %ProgramData%\BiFlow\target_ip.txt   (authoritative)
+///       2 = %TEMP%\BiFlow\bypass_apps.txt        (legacy fallback)
+///       3 = %ProgramData%\BiFlow\bypass_apps.txt (authoritative)
 fn write_policy_file(kind: u32, content: &str) {
     let path: PathBuf = match kind {
         0 => std::env::temp_dir().join("biflow_target_ip.txt"),
@@ -89,6 +175,134 @@ pub fn clear_target_ip() {
     // sockets once they are gone.
     for kind in 0..4 {
         remove_policy_file(kind);
+    }
+}
+
+/// Removes hook status files left behind by processes that have exited.
+/// Called once at startup, before any new injection happens.
+pub fn clear_stale_hook_status() {
+    let mut dirs = vec![std::env::temp_dir().join("BiFlow")];
+    if let Ok(prog) = std::env::var("ProgramData") {
+        dirs.push(PathBuf::from(prog).join("BiFlow"));
+    }
+    for dir in dirs {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("hook_status_") && name.ends_with(".txt") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+fn hook_status_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(prog) = std::env::var("ProgramData") {
+        dirs.push(PathBuf::from(prog).join("BiFlow"));
+    }
+    dirs.push(std::env::temp_dir().join("BiFlow"));
+    dirs
+}
+
+/// Waits for the injected DLL to report how many hooks it actually
+/// installed. This is what makes the UI's "Live" state honest: a successful
+/// LoadLibraryW alone does not prove the Winsock hooks are active.
+fn wait_for_hook_status(pid: u32) -> Result<u32, String> {
+    let deadline = Instant::now() + Duration::from_millis(2500);
+    loop {
+        for dir in hook_status_dirs() {
+            let path = dir.join(format!("hook_status_{}.txt", pid));
+            if let Ok(content) = fs::read_to_string(&path) {
+                let content = content.trim().to_string();
+                if let Some(rest) = content.strip_prefix("OK ") {
+                    let n: u32 = rest.trim().parse().unwrap_or(0);
+                    if n >= 5 {
+                        return Ok(n);
+                    }
+                    return Err(format!(
+                        "Hook DLL in PID {} installed only {}/5 hooks",
+                        pid, n
+                    ));
+                }
+                if content.starts_with("ERR") {
+                    return Err(format!("Hook DLL in PID {} reported: {}", pid, content));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Hook DLL in PID {} did not report its hook status (hooks may not be active)",
+                pid
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Checks (by module enumeration) that our DLL is really loaded in the
+/// target process. Returns None when enumeration is not possible, in which
+/// case the caller falls back to the LoadLibraryW exit code.
+fn process_has_our_module(pid: u32) -> Option<bool> {
+    let target = hook_dll_file_name().to_ascii_lowercase();
+    unsafe {
+        let snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut found = false;
+        if Module32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let name = String::from_utf16_lossy(
+                    &entry.szModule[..entry
+                        .szModule
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szModule.len())],
+                );
+                if name.to_ascii_lowercase() == target {
+                    found = true;
+                    break;
+                }
+                if Module32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        Some(found)
+    }
+}
+
+/// Creation timestamp (FILETIME ticks) of a process. Used to tell a live
+/// process apart from a new process that reused its PID.
+pub fn process_creation_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit_t: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(
+            process,
+            &mut creation,
+            &mut exit_t,
+            &mut kernel,
+            &mut user,
+        );
+        CloseHandle(process);
+        if ok == 0 {
+            None
+        } else {
+            Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+        }
     }
 }
 
@@ -182,56 +396,152 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
         VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
         CloseHandle(process);
 
-        if exit_code == 0 {
-            return Err(format!("LoadLibraryW returned NULL in PID {} (injection failed)", pid));
+        // GetExitCodeThread truncates the HMODULE to 32 bits; a module whose
+        // base address has zero low bits would look like a failure. Verify
+        // by module enumeration first and only then trust the exit code.
+        match process_has_our_module(pid) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(format!(
+                    "LoadLibraryW completed in PID {} but the hook DLL is not in its module list",
+                    pid
+                ));
+            }
+            None => {
+                if exit_code == 0 {
+                    return Err(format!("LoadLibraryW returned NULL in PID {} (injection failed)", pid));
+                }
+            }
         }
     }
 
-    Ok(())
+    // The DLL is loaded; now require proof that its hooks were installed
+    // before calling this injection "live".
+    wait_for_hook_status(pid).map(|_| ())
 }
 
-pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<u32, String> {
+/// Duplicates the shell (explorer.exe) primary token so a child process can
+/// be created WITHOUT inheriting BiFlow's administrator token.
+unsafe fn shell_primary_token() -> Option<HANDLE> {
+    let hwnd = GetShellWindow();
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut shell_pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut shell_pid);
+    if shell_pid == 0 {
+        return None;
+    }
+    let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, shell_pid);
+    if proc.is_null() {
+        return None;
+    }
+    let mut token: HANDLE = null_mut();
+    let ok = OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token);
+    CloseHandle(proc);
+    if ok == 0 {
+        return None;
+    }
+    let mut primary: HANDLE = null_mut();
+    let ok = DuplicateTokenEx(
+        token,
+        TOKEN_ALL_ACCESS,
+        null_mut(),
+        SecurityImpersonation,
+        TokenPrimary,
+        &mut primary,
+    );
+    CloseHandle(token);
+    if ok == 0 {
+        None
+    } else {
+        Some(primary)
+    }
+}
+
+pub struct LaunchOutcome {
+    pub pid: u32,
+    /// True when the process was started with the shell's medium-integrity
+    /// token (the normal, safe case); false when it had to inherit BiFlow's
+    /// elevated token as a fallback.
+    pub unelevated: bool,
+}
+
+pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<LaunchOutcome, String> {
     let dll_path = ensure_dll_extracted()?;
     update_target_ip(target_ip)?;
 
-    let exe_name = exe.file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let exe_name = exe
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     let wide_exe: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let parent_dir = exe.parent().unwrap_or(Path::new("."));
     let wide_dir: Vec<u16> = parent_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
 
-    // For Chromium browsers (Chrome, Edge, Brave), add flags to allow DLL injection and bypass system proxy directly
-    let cmd_str = if exe_name.contains("chrome") || exe_name.contains("msedge") || exe_name.contains("brave") {
-        format!("\"{}\" --disable-features=RendererCodeIntegrity --no-proxy-server", exe.display())
-    } else {
-        format!("\"{}\"", exe.display())
+    // For Chromium browsers (exact file names only), add flags to allow DLL
+    // injection and bypass the system proxy directly. This weakens the
+    // browser sandbox and is disclosed in the UI status after launch.
+    let is_chromium = matches!(
+        exe_name.as_str(),
+        "chrome.exe" | "msedge.exe" | "brave.exe"
+    );
+    let make_cmd_line = || -> Vec<u16> {
+        let cmd_str = if is_chromium {
+            format!("\"{}\" --disable-features=RendererCodeIntegrity --no-proxy-server", exe.display())
+        } else {
+            format!("\"{}\"", exe.display())
+        };
+        cmd_str.encode_utf16().chain(std::iter::once(0)).collect()
     };
-
-    let mut cmd_line: Vec<u16> = cmd_str
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // Set BIFLOW_TARGET_IP in our current environment so child inherits it
-    let env_val = target_ip.trim();
-    std::env::set_var("BIFLOW_TARGET_IP", env_val);
-
+    // Start the app at the user's normal integrity level whenever possible:
+    // a browser or game must not run as Administrator just because BiFlow
+    // itself is elevated.
+    let mut unelevated = false;
+    let mut cmd_line = make_cmd_line();
     let success = unsafe {
-        CreateProcessW(
-            wide_exe.as_ptr(),
-            cmd_line.as_mut_ptr(),
-            null_mut(),
-            null_mut(),
-            0,
-            CREATE_SUSPENDED,
-            null_mut(),
-            wide_dir.as_ptr(),
-            &mut si,
-            &mut pi,
-        )
+        let mut created = 0;
+        if let Some(token) = shell_primary_token() {
+            created = CreateProcessWithTokenW(
+                token,
+                LOGON_WITH_PROFILE,
+                wide_exe.as_ptr(),
+                cmd_line.as_mut_ptr(),
+                CREATE_SUSPENDED,
+                null_mut(),
+                wide_dir.as_ptr(),
+                &si,
+                &mut pi,
+            );
+            CloseHandle(token);
+            if created != 0 {
+                unelevated = true;
+            }
+        }
+        if created == 0 {
+            // Fallback: inherit BiFlow's token (elevated). The caller is told
+            // via LaunchOutcome.unelevated == false so the UI can warn.
+            cmd_line = make_cmd_line();
+            CreateProcessW(
+                wide_exe.as_ptr(),
+                cmd_line.as_mut_ptr(),
+                null_mut(),
+                null_mut(),
+                0,
+                CREATE_SUSPENDED,
+                null_mut(),
+                wide_dir.as_ptr(),
+                &si,
+                &mut pi,
+            )
+        } else {
+            created
+        }
     };
 
     if success == 0 {
@@ -240,19 +550,36 @@ pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<u32, String> {
 
     let pid = pi.dwProcessId;
 
-    // Inject our hook DLL into suspended process
+    // Inject our hook DLL into the still-suspended process.
     let inject_res = inject_dll_into_pid(pid, &dll_path);
 
-    // Resume the process thread
-    unsafe {
-        ResumeThread(pi.hThread);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+    match inject_res {
+        Ok(()) => {
+            unsafe {
+                ResumeThread(pi.hThread);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            Ok(LaunchOutcome { pid, unelevated })
+        }
+        Err(e) => {
+            // Never leave a silently un-bypassed copy running: the user asked
+            // for this app to start WITH the bypass, so a failed injection
+            // terminates the suspended process and reports honestly.
+            unsafe {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            Err(format!(
+                "Injection failed; the launched process was terminated so it does not run without the bypass: {}",
+                e
+            ))
+        }
     }
-
-    inject_res.map(|_| pid)
 }
 
+#[allow(dead_code)]
 pub fn find_pids_by_exe_name(exe_name: &str) -> Vec<u32> {
     let mut pids = Vec::new();
     let lower_target = exe_name.to_ascii_lowercase();
@@ -370,35 +697,23 @@ pub fn resolve_executable_path(name: &str) -> Option<String> {
 }
 
 pub fn get_process_full_path(pid: u32) -> Option<String> {
-    unsafe {
-        // Try PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
-        let process = OpenProcess(0x1000, 0, pid);
-        if !process.is_null() {
-            let mut buf = [0u16; 1024];
+    // Long-path aware: the buffer covers the full Win32 long path limit.
+    let mut buf = vec![0u16; 32767];
+    for access in [PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_QUERY_INFORMATION] {
+        unsafe {
+            let process = OpenProcess(access, 0, pid);
+            if process.is_null() {
+                continue;
+            }
             let mut len = buf.len() as u32;
             let success = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len);
             CloseHandle(process);
-
             if success != 0 && len > 0 {
                 return Some(String::from_utf16_lossy(&buf[..len as usize]));
             }
         }
-
-        // Secondary fallback with PROCESS_QUERY_INFORMATION (0x0400)
-        let process2 = OpenProcess(0x0400, 0, pid);
-        if !process2.is_null() {
-            let mut buf = [0u16; 1024];
-            let mut len = buf.len() as u32;
-            let success = QueryFullProcessImageNameW(process2, 0, buf.as_mut_ptr(), &mut len);
-            CloseHandle(process2);
-
-            if success != 0 && len > 0 {
-                return Some(String::from_utf16_lossy(&buf[..len as usize]));
-            }
-        }
-
-        None
     }
+    None
 }
 
 pub fn get_process_maps() -> (
@@ -505,8 +820,9 @@ pub fn get_running_gui_processes() -> Vec<(u32, String, String)> {
         CloseHandle(snapshot);
     }
 
-    procs.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()));
-    procs.dedup_by(|a, b| a.1.eq_ignore_ascii_case(&b.1));
+    // De-duplicate by full path (not by file name): the same exe name in two
+    // different folders is two different applications.
+    procs.sort_by(|a, b| a.2.to_ascii_lowercase().cmp(&b.2.to_ascii_lowercase()));
+    procs.dedup_by(|a, b| a.2.eq_ignore_ascii_case(&b.2));
     procs
 }
-

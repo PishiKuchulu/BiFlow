@@ -28,52 +28,16 @@ pub fn is_elevated() -> bool {
     }
 }
 
-#[cfg(windows)]
-pub fn enable_debug_privilege() -> bool {
-    unsafe {
-        let mut token: HANDLE = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-
-        let wide_name: Vec<u16> = "SeDebugPrivilege\0".encode_utf16().collect();
-        let mut luid = LUID { LowPart: 0, HighPart: 0 };
-        if LookupPrivilegeValueW(std::ptr::null(), wide_name.as_ptr(), &mut luid) == 0 {
-            CloseHandle(token);
-            return false;
-        }
-
-        let mut tp = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES {
-                Luid: luid,
-                Attributes: SE_PRIVILEGE_ENABLED,
-            }],
-        };
-
-        let ok = AdjustTokenPrivileges(
-            token,
-            0,
-            &mut tp as *mut _ as *mut _,
-            std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
-            null_mut(),
-            null_mut(),
-        );
-
-        CloseHandle(token);
-        ok != 0
-    }
-}
-
-#[cfg(not(windows))]
-pub fn enable_debug_privilege() -> bool {
-    false
-}
-
 #[cfg(not(windows))]
 pub fn is_elevated() -> bool {
     false
 }
+
+// NOTE: BiFlow deliberately does NOT enable SeDebugPrivilege anymore. Every
+// process query it performs works with PROCESS_QUERY_LIMITED_INFORMATION on
+// the user's own processes, and holding SeDebugPrivilege widens the attack
+// surface (any process compromise inherits the ability to open SYSTEM
+// processes) and is a strong malware heuristic for antivirus engines.
 
 #[cfg(windows)]
 pub fn restart_as_administrator() -> Result<(), String> {
@@ -102,16 +66,4 @@ pub fn restart_as_administrator() -> Result<(), String> {
 #[cfg(not(windows))]
 pub fn restart_as_administrator() -> Result<(), String> {
     Err("Not supported on non-Windows platforms".into())
-}
-
-#[allow(dead_code)]
-pub fn require_windows() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        Err("BiFlow is Windows-only.".into())
-    }
 }
