@@ -5,13 +5,23 @@ use std::{
 };
 use uuid::Uuid;
 
+pub type ProcessMaps = (
+    HashMap<String, Vec<u32>>,
+    HashMap<u32, u32>,
+    HashMap<u32, String>,
+);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ActiveBypass {
     pub app_id: Uuid,
     pub exe_path: PathBuf,
     pub exe_name: String,
-    pub injected_pids: HashSet<u32>,
+    /// PIDs the hook DLL is verified live in, mapped to the process creation
+    /// time (FILETIME ticks, 0 when unknown). Keying by creation time as
+    /// well as PID means a recycled PID is never mistaken for the process
+    /// that was originally injected.
+    pub injected_pids: HashMap<u32, u64>,
     /// True when the app was not running at apply time; the watchdog injects on launch.
     pub awaiting_process: bool,
     /// Set when the app was running but every injection attempt failed.
@@ -22,7 +32,8 @@ pub struct ActiveBypass {
 /// when the hook DLL is not actually inside the target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassLiveStatus {
-    /// Hook DLL is injected into at least one live process.
+    /// Hook DLL is injected into at least one live process AND the DLL
+    /// itself reported all of its Winsock hooks installed.
     Live,
     /// App is not running; the watchdog will inject when it starts.
     Pending,
@@ -75,7 +86,7 @@ impl EnforcementManager {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let mut injected_pids = HashSet::new();
+        let mut injected_pids: HashMap<u32, u64> = HashMap::new();
         let mut awaiting_process = false;
         let mut inject_error: Option<String> = None;
 
@@ -92,7 +103,8 @@ impl EnforcementManager {
                 for pid in pids {
                     match injector::inject_dll_into_pid(pid, &dll_path) {
                         Ok(_) => {
-                            injected_pids.insert(pid);
+                            injected_pids
+                                .insert(pid, injector::process_creation_time(pid).unwrap_or(0));
                         }
                         Err(e) => {
                             last_err = Some(e);
@@ -142,42 +154,65 @@ impl EnforcementManager {
         app_id: Uuid,
         exe: &PathBuf,
         direct: &InterfaceInfo,
-    ) -> Result<u32, String> {
+    ) -> Result<(u32, bool), String> {
         let source_ip = direct
             .ipv4
             .clone()
             .ok_or("Direct interface has no valid IPv4 address")?;
-
-        let pid = injector::launch_with_bypass(exe, &source_ip)?;
 
         let exe_name = exe
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Register the bypass and publish the policy files BEFORE the
+        // process starts, so the hook DLL finds the allow-list (including
+        // this exe) the moment it initializes.
         self.target_ip = Some(source_ip.clone());
-        let entry = self.active.entry(app_id).or_insert_with(|| ActiveBypass {
+        self.active.insert(
             app_id,
-            exe_path: exe.clone(),
-            exe_name,
-            injected_pids: HashSet::new(),
-            awaiting_process: false,
-            inject_error: None,
-        });
-        entry.injected_pids.insert(pid);
-        entry.awaiting_process = false;
-        entry.inject_error = None;
+            ActiveBypass {
+                app_id,
+                exe_path: exe.clone(),
+                exe_name: exe_name.clone(),
+                injected_pids: HashMap::new(),
+                awaiting_process: false,
+                inject_error: None,
+            },
+        );
+        self.sync_policy_files();
+
+        let outcome = match injector::launch_with_bypass(exe, &source_ip) {
+            Ok(o) => o,
+            Err(e) => {
+                self.active.remove(&app_id);
+                if self.active.is_empty() {
+                    self.target_ip = None;
+                }
+                self.sync_policy_files();
+                return Err(e);
+            }
+        };
+
+        if let Some(entry) = self.active.get_mut(&app_id) {
+            entry
+                .injected_pids
+                .insert(outcome.pid, injector::process_creation_time(outcome.pid).unwrap_or(0));
+            entry.awaiting_process = false;
+            entry.inject_error = None;
+        }
         self.sync_policy_files();
 
         config::append_log(&format!(
-            "LAUNCH_BYPASS app={} exe={} pid={} ip={}",
+            "LAUNCH_BYPASS app={} exe={} pid={} ip={} unelevated={}",
             app_id,
             exe.display(),
-            pid,
-            source_ip
+            outcome.pid,
+            source_ip,
+            outcome.unelevated
         ));
 
-        Ok(pid)
+        Ok((outcome.pid, outcome.unelevated))
     }
 
     pub fn remove(&mut self, app_id: Uuid) -> Result<(), String> {
@@ -206,8 +241,9 @@ impl EnforcementManager {
         self.active.contains_key(&app)
     }
 
-    /// Honest status used by the UI pill: never reports "bypassing" unless the
-    /// hook DLL is actually injected into a live process.
+    /// Honest status used by the UI pill: never reports "bypassing" unless
+    /// the hook DLL is actually injected into a live process and the DLL
+    /// confirmed its hooks are installed.
     pub fn live_status(&self, app_id: Uuid) -> Option<BypassLiveStatus> {
         self.active.get(&app_id).map(|b| {
             if !b.injected_pids.is_empty() {
@@ -230,31 +266,117 @@ impl EnforcementManager {
         self.active.len()
     }
 
-    pub fn check_watchdog(&mut self) {
+    /// One watchdog cycle. Runs on a dedicated background thread (see
+    /// AppState), never on the UI thread, and keeps working while the
+    /// window is hidden in the tray.
+    ///
+    /// - Re-reads the selected adapter's current IPv4 and republishes the
+    ///   policy when it changed (DHCP renewal, Wi-Fi roaming), so injected
+    ///   hooks stop binding to a dead address.
+    /// - Injects processes whose exe path matches a bypassed app, plus
+    ///   their descendants that live in the same install directory tree
+    ///   (launcher helpers such as steamwebhelper.exe).
+    pub fn check_watchdog(&mut self, maps: &ProcessMaps, direct_ip: Option<&str>) {
         if self.active.is_empty() {
             return;
         }
 
+        // Adapter IP drift: republish policy with the fresh address.
+        if let Some(ip) = direct_ip {
+            if self.target_ip.as_deref() != Some(ip) {
+                config::append_log(&format!(
+                    "ADAPTER_IP_CHANGED old={} new={}",
+                    self.target_ip.as_deref().unwrap_or("?"),
+                    ip
+                ));
+                self.target_ip = Some(ip.to_string());
+                self.sync_policy_files();
+            }
+        }
+
         let dll_path = match injector::ensure_dll_extracted() {
             Ok(p) => p,
-            Err(_) => return,
+            Err(e) => {
+                config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
+                return;
+            }
         };
+
+        let (_names, parents, paths) = maps;
 
         for bypass in self.active.values_mut() {
             if bypass.exe_name.is_empty() {
                 continue;
             }
-            let current_pids = injector::find_pids_by_exe_path(&bypass.exe_path);
-            // Purge dead PIDs from cache
-            bypass.injected_pids.retain(|pid| current_pids.contains(pid));
+            let target = bypass.exe_path.to_string_lossy().to_ascii_lowercase();
+            let app_dir = bypass
+                .exe_path
+                .parent()
+                .map(|p| p.to_string_lossy().to_ascii_lowercase());
 
-            let had_pids = !current_pids.is_empty();
+            // Primary processes: exact exe path match.
+            let mut current: HashSet<u32> = paths
+                .iter()
+                .filter(|(_, p)| p.to_ascii_lowercase() == target)
+                .map(|(pid, _)| *pid)
+                .collect();
+
+            // Descendants running from the same install tree (helper
+            // processes of launchers/multi-process apps).
+            if let Some(dir) = &app_dir {
+                let prefix = format!("{}\\", dir.trim_end_matches('\\'));
+                let descendants: Vec<u32> = paths
+                    .iter()
+                    .filter(|(pid, p)| {
+                        !current.contains(pid)
+                            && p.to_ascii_lowercase().starts_with(&prefix)
+                    })
+                    .map(|(pid, _)| *pid)
+                    .filter(|pid| {
+                        // Walk up the parent chain; covered when an ancestor
+                        // is one of the app's own processes.
+                        let mut cur = *pid;
+                        for _ in 0..8 {
+                            match parents.get(&cur) {
+                                Some(parent) if *parent != cur && *parent > 4 => {
+                                    if current.contains(parent) {
+                                        return true;
+                                    }
+                                    cur = *parent;
+                                }
+                                _ => break,
+                            }
+                        }
+                        false
+                    })
+                    .collect();
+                current.extend(descendants);
+            }
+
+            // Purge dead PIDs and entries whose creation time no longer
+            // matches (the PID was recycled by a different process).
+            bypass.injected_pids.retain(|pid, created| {
+                if !current.contains(pid) {
+                    return false;
+                }
+                if *created == 0 {
+                    return true;
+                }
+                injector::process_creation_time(*pid)
+                    .map(|now| now == *created)
+                    .unwrap_or(false)
+            });
+
+            let had_pids = !current.is_empty();
             let mut last_err: Option<String> = None;
-            for &pid in &current_pids {
-                if !bypass.injected_pids.contains(&pid) {
+            for &pid in &current {
+                if !bypass.injected_pids.contains_key(&pid) {
                     match injector::inject_dll_into_pid(pid, &dll_path) {
                         Ok(_) => {
-                            bypass.injected_pids.insert(pid);
+                            bypass.injected_pids.insert(
+                                pid,
+                                injector::process_creation_time(pid).unwrap_or(0),
+                            );
                         }
                         Err(e) => {
                             last_err = Some(e);
@@ -294,7 +416,7 @@ mod tests {
                 app_id: id,
                 exe_path: PathBuf::from("C:\\a.exe"),
                 exe_name: "a.exe".into(),
-                injected_pids: HashSet::new(),
+                injected_pids: HashMap::new(),
                 awaiting_process: true,
                 inject_error: None,
             },
@@ -308,7 +430,7 @@ mod tests {
         assert_eq!(m.live_status(id), Some(BypassLiveStatus::Failed));
 
         let b = m.active.get_mut(&id).unwrap();
-        b.injected_pids.insert(1234);
+        b.injected_pids.insert(1234, 42);
         assert_eq!(m.live_status(id), Some(BypassLiveStatus::Live));
     }
 }
