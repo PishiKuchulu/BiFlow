@@ -26,8 +26,25 @@ fn main() -> eframe::Result<()> {
         let _ = windows::privilege::restart_as_administrator();
     }
 
-    // Enable SeDebugPrivilege to query process paths and network endpoints across all sessions
-    let _ = windows::privilege::enable_debug_privilege();
+    // NOTE: SeDebugPrivilege is intentionally NOT enabled (not needed for
+    // PROCESS_QUERY_LIMITED_INFORMATION on the user's own processes, and a
+    // standing SeDebugPrivilege is both an attack surface and an AV signal).
+
+    // Single instance: two BiFlow processes would race over the same policy
+    // and config files. A second launch just focuses the running instance.
+    if !acquire_single_instance() {
+        windows::bring_window_to_front();
+        return Ok(());
+    }
+
+    // A previous run may have crashed or been killed before it could clean
+    // up: stale policy files would keep already-injected processes bypassing
+    // with a dead adapter address. AppState re-applies the saved profile
+    // rules right after this, so clearing first is safe.
+    windows::injector::clear_target_ip();
+    windows::injector::clear_stale_hook_status();
+
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
 
     let tray = match BiFlowTray::new() {
         Ok(t) => Some(t),
@@ -48,7 +65,8 @@ fn main() -> eframe::Result<()> {
             .with_title("BiFlow - Windows Split Routing")
             .with_icon(std::sync::Arc::new(icon_data))
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([920.0, 580.0]),
+            .with_min_inner_size([920.0, 580.0])
+            .with_visible(!start_minimized),
         ..Default::default()
     };
 
@@ -58,9 +76,40 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             setup_custom_style(&cc.egui_ctx);
             windows::tray::set_egui_context(cc.egui_ctx.clone());
-            Ok(Box::new(BiFlowApp::new(cc, tray)))
+            Ok(Box::new(BiFlowApp::new(cc, tray, start_minimized)))
         }),
     )
+}
+
+/// Creates the single-instance named mutex. Returns false when another
+/// BiFlow instance already holds it. The handle is deliberately leaked so
+/// the mutex lives for the whole process lifetime.
+fn acquire_single_instance() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<u16> = std::ffi::OsStr::new("Local\\BiFlow-SingleInstance-Mutex")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = windows_sys::Win32::System::Threading::CreateMutexW(
+            std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+        );
+        if handle.is_null() {
+            // If the mutex cannot be created, do not block startup.
+            return true;
+        }
+        if windows_sys::Win32::Foundation::GetLastError()
+            == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS
+        {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            return false;
+        }
+        // Intentionally not closed: the mutex handle must stay open for the
+        // whole process lifetime (the OS releases it when we exit).
+        true
+    }
 }
 
 fn setup_custom_style(ctx: &egui::Context) {
@@ -127,13 +176,13 @@ enum Tab {
 }
 
 impl BiFlowApp {
-    fn new(_cc: &eframe::CreationContext<'_>, tray: Option<BiFlowTray>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, tray: Option<BiFlowTray>, start_minimized: bool) -> Self {
         Self {
             state: AppState::new(),
             tab: Tab::Apps,
             new_profile_name: String::new(),
             _tray: tray,
-            is_hidden: false,
+            is_hidden: start_minimized,
             suppress_minimize_to_tray: false,
             save_notification: None,
             editing_profile_id: None,
@@ -160,6 +209,14 @@ impl BiFlowApp {
         // 2. Handle Disable All Request from Tray
         if windows::tray::take_disable_all_requested() {
             self.state.disable_all();
+        }
+
+        // 2b. Handle Exit Request from Tray (orderly shutdown on this
+        // thread, so no config save can be interrupted mid-write)
+        if windows::tray::take_exit_requested() {
+            self.state.disable_all();
+            windows::injector::clear_target_ip();
+            std::process::exit(0);
         }
 
         // 3. Handle Window Close Request (X button)
@@ -308,7 +365,7 @@ impl BiFlowApp {
                         )
                         .fill(egui::Color32::from_rgb(45, 20, 25)),
                     )
-                    .on_hover_text("Safely close BiFlow and restore standard routing")
+                    .on_hover_text("Close BiFlow and stop all bypasses (firewall block rules you created stay in Windows Firewall until you unblock them)")
                     .clicked()
                 {
                     self.state.disable_all();
@@ -333,6 +390,16 @@ impl BiFlowApp {
                     self.state.disable_all();
                 }
 
+                if self.state.bypasses_paused() {
+                    if ui
+                        .button("▶ Resume Bypasses")
+                        .on_hover_text("Re-apply the active profile's bypass rules")
+                        .clicked()
+                    {
+                        self.state.resume_all();
+                    }
+                }
+
                 if ui
                     .button("🔄 Refresh")
                     .on_hover_text("Scan for newly started apps and network adapters")
@@ -341,7 +408,7 @@ impl BiFlowApp {
                     self.state.refresh();
                 }
 
-                let active_count = self.state.manager.count();
+                let active_count = self.state.active_bypass_count();
                 if active_count > 0 {
                     ui.label(
                         egui::RichText::new(format!("⚡ {} Active", active_count))
@@ -402,13 +469,13 @@ impl BiFlowApp {
             .state
             .apps
             .iter()
-            .filter(|a| self.state.is_app_running(a))
+            .filter(|a| self.state.app_running_cached(a))
             .count();
         let online_apps_count = self
             .state
             .apps
             .iter()
-            .filter(|a| self.state.has_active_network(a))
+            .filter(|a| self.state.app_network_cached(a))
             .count();
         let active_bypasses_count = self.state.apps.iter().filter(|a| self.state.is_app_bypassed(a.id)).count();
 
@@ -601,12 +668,13 @@ impl BiFlowApp {
                         continue;
                     }
 
-                    // Fast in-memory state lookups (0 syscalls, 0 latency)
-                    let is_running = self.state.is_app_running(app);
-                    let has_net = self.state.has_active_network(app);
+                    // Cached per-app status, refreshed with the process
+                    // cache (no repeated scans on the render path)
+                    let is_running = self.state.app_running_cached(app);
+                    let has_net = self.state.app_network_cached(app);
                     let is_bypassed = self.state.is_app_bypassed(app.id);
-                    let live_status = self.state.manager.live_status(app.id);
-                    let inject_error = self.state.manager.inject_error(app.id);
+                    let live_status = self.state.live_status(app.id);
+                    let inject_error = self.state.inject_error(app.id);
                     let is_blocked = self.state.is_app_blocked(app.id);
 
                     if self.state.filter_running_only && !is_running {
@@ -1024,7 +1092,7 @@ impl BiFlowApp {
                 .map(|p| p.rules.iter().filter(|r| r.enabled).count())
                 .unwrap_or(0);
 
-            let live_count = self.state.manager.count();
+            let live_count = self.state.active_bypass_count();
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("Current Active Profile: {}", active_profile_name)).strong().color(egui::Color32::from_rgb(52, 211, 153)));
@@ -1274,7 +1342,7 @@ impl BiFlowApp {
                     .size(14.0)
                     .color(egui::Color32::from_rgb(56, 189, 248)),
             );
-            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.2.2");
+            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.3.0");
             ui.label(format!(
                 "Configuration path: {}",
                 config::store_path().display()
