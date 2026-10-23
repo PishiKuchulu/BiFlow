@@ -29,6 +29,11 @@ pub struct Profile {
     pub rules: Vec<BypassRule>,
     #[serde(default)]
     pub adapter_index: Option<u32>,
+    /// Stable adapter identity (the Windows adapter GUID). Preferred over
+    /// `adapter_index`, which is an IfIndex and is NOT stable across
+    /// reboots or driver reinstalls.
+    #[serde(default)]
+    pub adapter_id: Option<String>,
 }
 
 impl Profile {
@@ -41,14 +46,21 @@ impl Profile {
             priority: 0,
             rules: Vec::new(),
             adapter_index: None,
+            adapter_id: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
+    // Every field carries a serde default so that a config written by an
+    // older/newer build (or with one field missing) loads with defaults
+    // instead of being renamed to .corrupt and reset wholesale.
+    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
     pub active_profile: Option<Uuid>,
+    #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub custom_apps: Vec<AppEntry>,
@@ -64,10 +76,18 @@ pub struct Store {
     pub autostart: bool,
     #[serde(default)]
     pub selected_adapter_index: Option<u32>,
+    /// Stable GUID of the selected adapter; preferred over the IfIndex in
+    /// `selected_adapter_index` whenever both are present.
+    #[serde(default)]
+    pub selected_adapter_id: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_schema_version() -> u32 {
+    2
 }
 
 impl Default for Store {
@@ -83,6 +103,7 @@ impl Default for Store {
                 priority: 100,
                 rules: vec![],
                 adapter_index: None,
+                adapter_id: None,
             }],
             custom_apps: vec![],
             blocked_apps: vec![],
@@ -91,6 +112,7 @@ impl Default for Store {
             close_to_tray: true,
             autostart: false,
             selected_adapter_index: None,
+            selected_adapter_id: None,
         }
     }
 }
@@ -99,19 +121,14 @@ impl Default for Store {
 pub struct InterfaceInfo {
     pub name: String,
     pub index: u32,
+    /// Windows adapter GUID (AdapterName from GetAdaptersAddresses).
+    /// Stable across reboots, unlike `index` (an IfIndex).
+    pub adapter_id: String,
     pub status: String,
     pub description: String,
     pub ipv4: Option<String>,
     pub gateway: Option<String>,
     pub virtual_adapter: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum EnforcementStatus {
-    NotConfigured,
-    Applied,
-    Failed(String),
 }
 
 #[cfg(test)]
