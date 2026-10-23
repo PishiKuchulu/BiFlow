@@ -127,7 +127,6 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "tray-icon",
  "uuid",
  "windows-sys 0.61.2",
