@@ -2,7 +2,7 @@
 
 The application intentionally avoids fake verification.
 
-A policy is reported as `Applied` only after the Windows API accepts it. The UI does not label the target `Verified Direct` because determining the observed path of arbitrary third-party traffic requires runtime evidence from the actual Windows host and the active VPN.
+A bypass is reported as `Live` in the UI only when (a) the hook DLL is present in the target process's module list and (b) the DLL itself reported back that all 5 of its Winsock hooks were installed successfully. A successful `LoadLibraryW` alone is never presented as a live bypass. The UI does not label the target `Verified Direct` because determining the observed path of arbitrary third-party traffic requires runtime evidence from the actual Windows host and the active VPN.
 
 For manual verification, compare:
 
