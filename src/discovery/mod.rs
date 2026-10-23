@@ -42,23 +42,60 @@ pub fn discover() -> Vec<AppEntry> {
                     }
                 }
 
-                // 2. Try InstallLocation if DisplayIcon wasn't an executable
+                // 2. Try InstallLocation if DisplayIcon wasn't an executable.
+                //    Collect all plausible main executables first, then pick
+                //    the best one: previously the FIRST exe in arbitrary
+                //    read_dir order won, which could select a helper such as
+                //    crashpad_handler.exe or a redistributable installer.
                 if executable.is_empty() {
                     let location: String = key.get_value("InstallLocation").unwrap_or_default();
                     if !location.is_empty() {
                         let loc_path = Path::new(location.trim().trim_matches('"'));
                         if loc_path.is_dir() {
                             if let Ok(entries) = std::fs::read_dir(loc_path) {
+                                let mut candidates: Vec<std::path::PathBuf> = Vec::new();
                                 for entry in entries.flatten() {
                                     let p = entry.path();
                                     if p.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("exe")) {
                                         let file_stem = p.file_stem().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
-                                        // Skip uninstallers
-                                        if !file_stem.contains("unins") && !file_stem.contains("setup") && !file_stem.contains("update") {
-                                            executable = p.to_string_lossy().to_string();
-                                            break;
+                                        // Skip uninstallers, installers, updaters,
+                                        // crash reporters and redistributables.
+                                        const SKIP: &[&str] = &[
+                                            "unins", "setup", "update", "crashpad",
+                                            "vc_redist", "redist", "installer",
+                                        ];
+                                        if !SKIP.iter().any(|s| file_stem.contains(s)) {
+                                            candidates.push(p);
                                         }
                                     }
+                                }
+                                if !candidates.is_empty() {
+                                    // Prefer the exe whose stem matches the
+                                    // product's display name; else the first
+                                    // candidate in stable (sorted) order.
+                                    candidates.sort();
+                                    let name_key: String = name
+                                        .to_ascii_lowercase()
+                                        .chars()
+                                        .filter(|c| c.is_ascii_alphanumeric())
+                                        .collect();
+                                    let best = candidates
+                                        .iter()
+                                        .find(|p| {
+                                            let stem: String = p
+                                                .file_stem()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_ascii_lowercase()
+                                                .chars()
+                                                .filter(|c| c.is_ascii_alphanumeric())
+                                                .collect();
+                                            !stem.is_empty()
+                                                && (name_key.starts_with(&stem)
+                                                    || stem.starts_with(&name_key))
+                                        })
+                                        .unwrap_or(&candidates[0]);
+                                    executable = best.to_string_lossy().to_string();
                                 }
                             }
                         }
