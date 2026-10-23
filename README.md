@@ -140,6 +140,25 @@ BiFlow.exe
 
 ---
 
+## 🛡️ Safety Warnings
+
+- **Not code-signed:** Windows SmartScreen will warn on first run, and some antivirus products may flag BiFlow heuristically — its core technique (DLL injection into other processes) resembles malware behavior. Download only from this repository's Releases and verify the SHA-256 checksums in `SHA256SUMS.txt`.
+- **Anti-cheat protected games:** never use BiFlow with games protected by Easy Anti-Cheat, BattlEye, Vanguard or similar systems. Injecting any DLL into such a game can get your account banned.
+- **Administrator rights:** BiFlow runs elevated. Apps started via "Launch Direct" are started *without* administrator rights whenever possible, and BiFlow warns in the status line when one had to be launched elevated.
+
+---
+
+## 🧹 Uninstall / Cleanup
+
+BiFlow is portable — delete `BiFlow.exe` and you are almost done. For a full cleanup also remove:
+
+- `%ProgramData%\BiFlow` (hook DLL, policy files, autostart task XML)
+- `%LOCALAPPDATA%\BiFlow` (config + log) — or the `data` folder next to the exe in portable mode
+- any `BiFlow_Block_*` rules in Windows Defender Firewall (or unblock all apps in BiFlow before deleting it)
+- the `BiFlow` Scheduled Task if you enabled autostart (or disable autostart in Settings first)
+
+---
+
 ## 🤝 Contributing
 
 Contributions, bug reports, and feature suggestions are very welcome!

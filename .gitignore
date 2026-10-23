@@ -10,7 +10,7 @@
 
 # Logs and runtime data
 *.log
-data/
+/data/
 *.tmp
 *.bak
 
