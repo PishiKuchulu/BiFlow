@@ -43,4 +43,3 @@ fn profile_serialization_supports_adapter_index_and_rules() {
         Some("C:\\Telegram\\Telegram.exe".into())
     );
 }
-
