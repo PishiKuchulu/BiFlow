@@ -42,7 +42,9 @@ fn main() {
     println!("cargo:rustc-link-lib=user32");
     // Manifest (requireAdministrator) only on the real binary, not on test
     // harnesses: `cargo test` must also work from a non-elevated shell.
-    println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'");
+    println!(
+        "cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+    );
 
     let res_obj = std::path::Path::new("assets/biflow_res.obj");
     if res_obj.exists() {
