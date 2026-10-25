@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.3.1 — 2026-10-25
+
+Second external review (16 findings: 7 P1 + 10 P2, of v0.3.0) verified
+line-by-line; every finding was confirmed in code and is fixed below,
+except P1-6, which is documented as an inherent Winsock-hook limitation
+(see LIMITATIONS.md). CI quality gates are now blocking.
+
+### Firewall (P1-1, P1-2)
+- Block verification now checks the inbound and outbound rule separately
+  (netsh readback per direction): an existing rule in one direction can no
+  longer mask a missing rule in the other. A failed query is "unknown",
+  never "absent". Partial creation rolls the surviving half-rule back.
+- Unblock and batch-clear verify removal per direction and per app, and
+  report every ID that could not be removed or verified; the UI only
+  drops apps whose removal was actually verified. The PowerShell fallback
+  now creates rules with the same `-Name` netsh uses, so the readback can
+  see them.
+
+### Policy publication (P1-3, P2-10)
+- Policy writes are no longer silently ignored: `update_target_ip`,
+  `update_bypass_app_list` and `clear_target_ip` return `Result`, policy
+  files are written via temp-file + flush + rename-replace, and every
+  manager operation (apply, launch, remove, clear, watchdog drift) rolls
+  its in-memory change back when publication fails instead of claiming a
+  bypass that was never published.
+- `%TEMP%` policy fallbacks are removed entirely (Rust writer and C hook):
+  `%ProgramData%\BiFlow` is the only policy location, and a missing
+  allow-list is now fail-closed (bypass off), not permissive. Legacy TEMP
+  copies are still deleted on cleanup.
+
+### Live semantics and watchdog (P1-4, P2-5)
+- If the direct adapter reports no usable IPv4 for two consecutive
+  watchdog cycles, the policy is fail-closed (files deleted, entries
+  marked Failed) instead of leaving injected processes bound to a stale
+  address while the UI reports Live.
+- The watchdog cycle is split into snapshot / plan + inject / commit, so
+  the manager mutex is never held across an injection wait; the UI renders
+  from one status snapshot per frame instead of three locks per row.
+
+### Profiles and pause (P1-5, P2-1, P2-3, P2-7, P2-6, P2-8)
+- Profile rules now register in the enforcement manager even when the app
+  was never discovered (by stored exe_path), so the watchdog injects the
+  process when it later appears; startup no longer silently drops them.
+- Pause is recomputed from "enabled rules not currently enforced" after
+  every change: enabling one app while paused can no longer hide Resume
+  for the others.
+- `Profile.enabled=false` is now honored by automatic application
+  (startup, adapter switch); explicit actions (toggle, launch, resume,
+  switch-to) wake a dormant profile.
+- Profiles created from an auto-detected adapter now resolve and store
+  the adapter GUID, not just the unstable IfIndex (also fixed in
+  save-current-bypasses and at startup).
+- Toggle/remove/save now sync the profile baseline only when the save
+  succeeds, so "Modified" can never describe an already-persisted change
+  and Revert can never undo one; `save()` returns `Result` and every
+  caller reports a persistence failure instead of overwriting it with a
+  success message.
+
+### Status correctness (P2-2, P2-4)
+- "Running" and "Active Internet" are decided by full executable path
+  only; the basename-keyed process map is no longer consulted, so a
+  same-name binary in another folder cannot make an app look running or
+  online. Auto-discovery dedups by exe path only (no display-name match).
+- Launch status no longer says "directly bypassing VPN": it reports the
+  hook installation and states that the egress route is not verified; the
+  Live pill hover says the same.
+
+### Hook (P2-9, P1-6)
+- connect/WSAConnect/sendto/WSASendTo now require a complete `sockaddr_in`
+  (`namelen >= sizeof(sockaddr_in)`) before casting, closing the
+  short-sockaddr over-read (bind already checked).
+- P1-6 documented, not "fixed": at bind time a future `listen()` cannot
+  be distinguished from a ConnectEx client bind, and a bound socket cannot
+  be unbound, so an INADDR_ANY:0 TCP listener of a bypassed app listens
+  on the physical IP only. Servers binding an explicit port are unaffected.
+
+### ACL (P1-7)
+- The ProgramData DACL now carries OI/CI inheritance, is applied with
+  `SetNamedSecurityInfoW` (not the superseded `SetFileSecurityW`), and is
+  verified: bin/, the DLL file and every policy file get the checked ACL,
+  and a failure fails the extraction/publication instead of proceeding on
+  assumed protection.
+
+### Quality gates
+- `cargo fmt --check` passes (whole tree formatted) and
+  `cargo clippy --locked --all-targets -- -D warnings` passes on the
+  Windows target; both CI steps are now blocking instead of
+  `continue-on-error`.
+
 ## v0.3.0 — 2026-10-23
 
 Full fix pass over an external line-by-line review (42 findings). Highlights:
