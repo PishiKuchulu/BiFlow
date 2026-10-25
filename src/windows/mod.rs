@@ -21,7 +21,9 @@ pub fn get_main_window_hwnd() -> windows_sys::Win32::Foundation::HWND {
             unsafe {
                 let data = &mut *(lparam as *mut SearchData);
                 let mut pid = 0u32;
-                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, &mut pid);
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    hwnd, &mut pid,
+                );
                 if pid == data.pid {
                     let mut title_buf = [0u16; 256];
                     let len = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(

@@ -123,8 +123,8 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
         // The XML file is written into the ACL-protected ProgramData folder,
         // not %TEMP%: it is handed to an elevated scheduler, so its location
         // must not be writable by non-elevated processes.
-        let xml_dir = crate::windows::injector::biflow_programdata_dir()
-            .unwrap_or_else(std::env::temp_dir);
+        let xml_dir =
+            crate::windows::injector::biflow_programdata_dir().unwrap_or_else(std::env::temp_dir);
         let xml_path = xml_dir.join("biflow_autostart_task.xml");
         // schtasks /XML expects a UTF-16LE file.
         let xml = task_xml(&exe);

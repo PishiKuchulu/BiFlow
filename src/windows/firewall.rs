@@ -52,14 +52,40 @@ pub fn block_app(app_id: &Uuid, app_name: &str, exe_path: &str) -> Result<(), St
             }
         }
 
-        // Verify rule presence. If netsh failed, use PowerShell as fallback.
-        if !is_rule_present(app_id) {
+        // Verify BOTH directions separately: a rule with this name in one
+        // direction must never mask a missing rule in the other direction,
+        // and a failed query is "unknown", never "absent".
+        let mut dirs = query_rule_directions(app_id);
+        if !matches!(dirs, Ok((true, true))) {
+            // Fall back to PowerShell (with the same rule -Name, so the
+            // netsh readback below can see what it created), then retry.
             run_powershell_block(&name, clean_path);
+            dirs = query_rule_directions(app_id);
         }
-
-        if let Some(e) = out_err {
-            if !is_rule_present(app_id) {
-                return Err(e);
+        match dirs {
+            Ok((true, true)) => {}
+            Ok((false, false)) => {
+                return Err(out_err.unwrap_or_else(|| {
+                    "Firewall block rules could not be created or verified".into()
+                }));
+            }
+            Ok((out, inn)) => {
+                // Partial success is not success: remove the surviving
+                // half-rule so the app is not left half-blocked, and say so.
+                let _ = run_netsh_line(&format!(
+                    "netsh advfirewall firewall delete rule name=\"{}\"",
+                    name
+                ));
+                return Err(format!(
+                    "Only one firewall direction was created for {} (out={}, in={}); the partial rule was removed",
+                    app_name, out, inn
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Firewall block for {} could not be verified: {}",
+                    app_name, e
+                ));
             }
         }
     } else {
@@ -88,10 +114,14 @@ pub fn block_app(app_id: &Uuid, app_name: &str, exe_path: &str) -> Result<(), St
 }
 
 fn run_powershell_block(name: &str, clean_path: &str) {
+    // -Name is set to the same value netsh uses, so the netsh readback in
+    // query_rule_directions can see rules this fallback created.
     let ps_add = format!(
-        "New-NetFirewallRule -DisplayName '{}' -Direction Outbound -Action Block -Program '{}' -Enabled True -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName '{}' -Direction Inbound -Action Block -Program '{}' -Enabled True -ErrorAction SilentlyContinue",
+        "New-NetFirewallRule -Name '{}' -DisplayName '{}' -Direction Outbound -Action Block -Program '{}' -Enabled True -ErrorAction SilentlyContinue; New-NetFirewallRule -Name '{}' -DisplayName '{}' -Direction Inbound -Action Block -Program '{}' -Enabled True -ErrorAction SilentlyContinue",
+        name,
         name,
         clean_path.replace('\'', "''"),
+        name,
         name,
         clean_path.replace('\'', "''"),
     );
@@ -111,7 +141,7 @@ pub fn unblock_app(app_id: &Uuid) -> Result<(), String> {
     let script_lines = vec![
         format!("netsh advfirewall firewall delete rule name=\"{}\"", name),
         format!(
-            "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue\"",
+            "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -Name '{}' -ErrorAction SilentlyContinue\"",
             name
         ),
     ];
@@ -120,28 +150,73 @@ pub fn unblock_app(app_id: &Uuid) -> Result<(), String> {
         let _ = run_netsh_line(line);
     }
 
-    // Verify the rule is really gone before reporting success: previously
-    // this always returned Ok, so the UI removed the app from the blocked
+    // Verify the rule is really gone in BOTH directions before reporting
+    // success. A failed query is "unknown", never "absent": reporting Ok
+    // on a query failure used to make the UI drop the app from the blocked
     // list while the firewall rule could still be silently in force.
-    if is_rule_present(app_id) {
-        return Err(format!(
-            "Firewall rule {} is still present after the delete attempt",
-            name
-        ));
+    match query_rule_directions(app_id) {
+        Ok((false, false)) => {}
+        Ok((out, inn)) => {
+            return Err(format!(
+                "Firewall rule {} is still present after the delete attempt (out={}, in={})",
+                name, out, inn
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "Firewall rule removal for {} could not be verified: {}",
+                name, e
+            ));
+        }
     }
 
     crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", app_id));
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn is_rule_present(app_id: &Uuid) -> bool {
-    let name = rule_name(app_id);
-    if let Ok(output) = run_netsh(&["advfirewall", "firewall", "show", "rule", &format!("name={}", name)]) {
-        output.contains(&name)
-    } else {
-        false
+/// Query whether the block rule exists, separately per direction.
+/// Returns Err when the query itself fails: "unknown" must never be read
+/// as "absent". A "No rules match" answer counts as absent even if netsh
+/// reports it with a non-zero exit code.
+pub fn query_rule_directions(app_id: &Uuid) -> Result<(bool, bool), String> {
+    fn query_one(name: &str, dir: &str) -> Result<bool, String> {
+        if !crate::windows::privilege::is_elevated() {
+            return Err("netsh requires BiFlow to run as Administrator.".into());
+        }
+        let output = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={}", name),
+                &format!("dir={}", dir),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed to execute netsh: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stdout.contains("No rules match") || stderr.contains("No rules match") {
+            return Ok(false);
+        }
+        if !output.status.success() {
+            let msg = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("netsh failed with exit code {:?}", output.status.code())
+            };
+            return Err(msg);
+        }
+        Ok(stdout.contains(name))
     }
+
+    let name = rule_name(app_id);
+    let out = query_one(&name, "out")?;
+    let inn = query_one(&name, "in")?;
+    Ok((out, inn))
 }
 
 pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
@@ -152,26 +227,44 @@ pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
     let mut script_lines: Vec<String> = Vec::new();
     for id in app_ids {
         let name = rule_name(id);
-        script_lines.push(format!("netsh advfirewall firewall delete rule name=\"{}\"", name));
-        crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", id));
+        script_lines.push(format!(
+            "netsh advfirewall firewall delete rule name=\"{}\"",
+            name
+        ));
     }
 
     // Comprehensive purge: remove any orphaned BiFlow rules in one operation.
     script_lines.push(
-        "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -DisplayName 'BiFlow_Block*' -ErrorAction SilentlyContinue\"".to_string(),
+        "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -Name 'BiFlow_Block*' -ErrorAction SilentlyContinue\"".to_string(),
     );
 
     for line in &script_lines {
         let _ = run_netsh_line(line);
     }
 
-    // Verify: report failure if any of the rules survived the purge, so the
-    // caller does not clear its own blocked list while Windows still blocks.
-    let remaining: Vec<&Uuid> = app_ids.iter().filter(|id| is_rule_present(id)).collect();
-    if !remaining.is_empty() {
+    // Verify per ID with a real readback, and report every ID that failed:
+    // a failed query is "unknown", never "absent", and only verified
+    // removals are logged, so the caller never clears its blocked list
+    // while Windows still blocks.
+    let mut failures: Vec<String> = Vec::new();
+    for id in app_ids {
+        match query_rule_directions(id) {
+            Ok((false, false)) => {
+                crate::config::append_log(&format!("UNBLOCK_INTERNET app={}", id));
+            }
+            Ok((out, inn)) => {
+                failures.push(format!("{} (out={}, in={})", id, out, inn));
+            }
+            Err(e) => {
+                failures.push(format!("{} (verification failed: {})", id, e));
+            }
+        }
+    }
+    if !failures.is_empty() {
         return Err(format!(
-            "{} firewall rule(s) could not be removed",
-            remaining.len()
+            "{} firewall rule(s) could not be removed or verified: {}",
+            failures.len(),
+            failures.join(", ")
         ));
     }
     Ok(())
@@ -295,6 +388,9 @@ mod tests {
     #[test]
     fn rule_names_are_stable() {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        assert_eq!(rule_name(&id), "BiFlow_Block_12345678123412341234123456789abc");
+        assert_eq!(
+            rule_name(&id),
+            "BiFlow_Block_12345678123412341234123456789abc"
+        );
     }
 }

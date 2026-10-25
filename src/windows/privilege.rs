@@ -43,8 +43,15 @@ pub fn is_elevated() -> bool {
 pub fn restart_as_administrator() -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let wide_exe: Vec<u16> = current_exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let wide_verb: Vec<u16> = std::ffi::OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+    let wide_exe: Vec<u16> = current_exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_verb: Vec<u16> = std::ffi::OsStr::new("runas")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let res = windows_sys::Win32::UI::Shell::ShellExecuteW(
@@ -58,7 +65,10 @@ pub fn restart_as_administrator() -> Result<(), String> {
         if res as usize > 32 {
             std::process::exit(0);
         } else {
-            Err(format!("Elevation request failed (error code {})", res as usize))
+            Err(format!(
+                "Elevation request failed (error code {})",
+                res as usize
+            ))
         }
     }
 }

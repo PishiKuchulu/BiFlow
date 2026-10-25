@@ -32,22 +32,36 @@ static ACL_ONCE: std::sync::Once = std::sync::Once::new();
 /// read/execute. That is what stops a same-user, non-elevated process from
 /// swapping the DLL or the policy files that the elevated BiFlow later loads
 /// into other processes (local privilege-escalation via %TEMP%).
+/// The ACEs carry OI/CI inheritance, so children created later (bin/, the
+/// DLL, the policy files) inherit them; the security-critical objects also
+/// get the same DACL applied explicitly and checked (see
+/// apply_protected_acl), because a directory DACL alone never proves what
+/// its children ended up with.
 pub fn biflow_programdata_dir() -> Option<PathBuf> {
     let prog = std::env::var("ProgramData").ok()?;
     let dir = PathBuf::from(prog).join("BiFlow");
     let _ = fs::create_dir_all(&dir);
-    ACL_ONCE.call_once(|| set_admin_only_acl(&dir));
+    ACL_ONCE.call_once(|| {
+        let _ = apply_protected_acl(&dir);
+    });
     Some(dir)
 }
 
-fn set_admin_only_acl(dir: &Path) {
+/// Applies the protected admin-only DACL to one path and verifies the
+/// result: unlike the old best-effort directory call, a failure here is
+/// reported so injection/policy publication never proceeds on assumed
+/// protection. Uses SetNamedSecurityInfoW (the documented replacement for
+/// the superseded SetFileSecurityW).
+pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     // D:P  = protected DACL (no inheritance from the parent folder)
+    // OICI = object + container inherit (children inherit these ACEs)
     // FA   = full access for SYSTEM (SY) and Administrators (BA)
     // GRGX = generic read/execute for Users (BU)
-    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)"
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -59,20 +73,45 @@ fn set_admin_only_acl(dir: &Path) {
             &mut psd,
             null_mut(),
         );
-        if ok != 0 && !psd.is_null() {
-            let wide: Vec<u16> = dir
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let _ = SetFileSecurityW(
-                wide.as_ptr(),
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                psd,
-            );
+        if ok == 0 || psd.is_null() {
+            return Err(format!(
+                "Could not build security descriptor for {}",
+                path.display()
+            ));
+        }
+        // BOOL is i32 in windows-sys (windows_sys::core::BOOL).
+        let mut present: i32 = 0;
+        let mut dacl: *mut ACL = null_mut();
+        let mut defaulted: i32 = 0;
+        let got = GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted);
+        if got == 0 || present == 0 || dacl.is_null() {
             LocalFree(psd as HLOCAL);
+            return Err(format!("Could not extract DACL for {}", path.display()));
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let err = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl as *const ACL,
+            null_mut(),
+        );
+        LocalFree(psd as HLOCAL);
+        if err != 0 {
+            return Err(format!(
+                "Could not set ACL on {} (Win32 error {})",
+                path.display(),
+                err
+            ));
         }
     }
+    Ok(())
 }
 
 pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
@@ -80,11 +119,15 @@ pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
         .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?
         .join("bin");
     fs::create_dir_all(&base).map_err(|e| format!("Cannot create {}: {}", base.display(), e))?;
+    // The DLL is loaded into other processes: its directory and the file
+    // itself get the checked protected ACL, and a failure here fails the
+    // extraction instead of injecting a DLL whose protection is assumed.
+    apply_protected_acl(&base)?;
     let dll_path = base.join(hook_dll_file_name());
 
     // Verify the FULL content, not just the size: a same-size impostor DLL
-    // must never be injected. (The directory ACL above is the primary
-    // defense; this catches corruption and stale builds.)
+    // must never be injected. (The ACL above is the primary defense; this
+    // catches corruption and stale builds.)
     let current = fs::read(&dll_path).ok();
     if current.as_deref() != Some(EMBEDDED_HOOK_DLL) {
         fs::write(&dll_path, EMBEDDED_HOOK_DLL).map_err(|e| {
@@ -100,6 +143,9 @@ pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
             return Err("Hook DLL content verification failed after writing it".into());
         }
     }
+    // Also protect a pre-existing DLL (e.g. from an older BiFlow) that did
+    // not need rewriting: its ACL must be proven, not inherited by luck.
+    apply_protected_acl(&dll_path)?;
 
     // Best-effort cleanup of DLLs from older BiFlow versions.
     if let Ok(entries) = fs::read_dir(&base) {
@@ -114,67 +160,65 @@ pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
     Ok(dll_path)
 }
 
-pub fn update_target_ip(ip: &str) -> Result<(), String> {
-    let _ = biflow_programdata_dir();
-    let clean = ip.trim();
-    write_policy_file(0, clean);
-    write_policy_file(1, clean);
+/// Writes a policy file into %ProgramData%\BiFlow atomically: temp file in
+/// the same directory + flush + rename-replace, then the checked protected
+/// ACL. ProgramData is the ONLY policy location now: the %TEMP% fallbacks
+/// were removed because a stale TEMP copy could resurrect a deleted policy
+/// and because TEMP was never protected by the admin-only DACL.
+fn write_pd_policy_file(leaf: &str, content: &str) -> Result<(), String> {
+    let dir = biflow_programdata_dir()
+        .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
+    let final_path = dir.join(leaf);
+    let tmp_path = dir.join(format!(".{}-{}.tmp", leaf, std::process::id()));
+    fs::write(&tmp_path, content)
+        .map_err(|e| format!("Cannot write {}: {}", tmp_path.display(), e))?;
+    // Flush to disk before the rename so a crash cannot leave a torn file.
+    if let Ok(f) = fs::File::open(&tmp_path) {
+        let _ = f.sync_all();
+    }
+    fs::rename(&tmp_path, &final_path)
+        .map_err(|e| format!("Cannot publish {}: {}", final_path.display(), e))?;
+    apply_protected_acl(&final_path)?;
     Ok(())
+}
+
+pub fn update_target_ip(ip: &str) -> Result<(), String> {
+    write_pd_policy_file("target_ip.txt", ip.trim())
 }
 
 /// Writes the allow-list of bypassed executables (one full path per line,
 /// UTF-8). The injected hook only binds sockets for processes on this list,
 /// so removing one app stops its bypass without affecting the others.
-pub fn update_bypass_app_list(exe_paths: &[String]) {
-    let _ = biflow_programdata_dir();
-    let content = exe_paths.join("\n");
-    write_policy_file(2, &content);
-    write_policy_file(3, &content);
+pub fn update_bypass_app_list(exe_paths: &[String]) -> Result<(), String> {
+    write_pd_policy_file("bypass_apps.txt", &exe_paths.join("\n"))
 }
 
-/// kind: 0 = %TEMP%\biflow_target_ip.txt           (legacy fallback)
-///       1 = %ProgramData%\BiFlow\target_ip.txt   (authoritative)
-///       2 = %TEMP%\BiFlow\bypass_apps.txt        (legacy fallback)
-///       3 = %ProgramData%\BiFlow\bypass_apps.txt (authoritative)
-fn write_policy_file(kind: u32, content: &str) {
-    let path: PathBuf = match kind {
-        0 => std::env::temp_dir().join("biflow_target_ip.txt"),
-        2 => std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"),
-        _ => match std::env::var("ProgramData") {
-            Ok(prog_data) => {
-                let leaf = if kind == 1 { "target_ip.txt" } else { "bypass_apps.txt" };
-                PathBuf::from(prog_data).join("BiFlow").join(leaf)
-            }
-            Err(_) => return,
-        },
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+/// Deletes the policy files: the disable signal, since the injected hook
+/// re-validates them on every intercepted call and stops binding new
+/// sockets once they are gone. Also removes any legacy %TEMP% copies left
+/// by older BiFlow versions. Attempts every deletion and reports the first
+/// failure instead of silently pretending cleanup succeeded.
+pub fn clear_target_ip() -> Result<(), String> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(prog) = std::env::var("ProgramData") {
+        let base = PathBuf::from(prog).join("BiFlow");
+        paths.push(base.join("target_ip.txt"));
+        paths.push(base.join("bypass_apps.txt"));
     }
-    let _ = fs::write(path, content);
-}
-
-fn remove_policy_file(kind: u32) {
-    let path: PathBuf = match kind {
-        0 => std::env::temp_dir().join("biflow_target_ip.txt"),
-        2 => std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"),
-        _ => match std::env::var("ProgramData") {
-            Ok(prog_data) => {
-                let leaf = if kind == 1 { "target_ip.txt" } else { "bypass_apps.txt" };
-                PathBuf::from(prog_data).join("BiFlow").join(leaf)
+    paths.push(std::env::temp_dir().join("biflow_target_ip.txt"));
+    paths.push(std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"));
+    let mut first_err: Option<String> = None;
+    for p in paths {
+        if let Err(e) = fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound && first_err.is_none() {
+                first_err = Some(format!("Cannot delete {}: {}", p.display(), e));
             }
-            Err(_) => return,
-        },
-    };
-    let _ = fs::remove_file(path);
-}
-
-pub fn clear_target_ip() {
-    // Deleting the policy files is the disable signal: the injected hook
-    // re-validates them on every intercepted call and stops binding new
-    // sockets once they are gone.
-    for kind in 0..4 {
-        remove_policy_file(kind);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -247,8 +291,7 @@ fn wait_for_hook_status(pid: u32) -> Result<u32, String> {
 fn process_has_our_module(pid: u32) -> Option<bool> {
     let target = hook_dll_file_name().to_ascii_lowercase();
     unsafe {
-        let snapshot =
-            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if snapshot == INVALID_HANDLE_VALUE {
             return None;
         }
@@ -290,13 +333,7 @@ pub fn process_creation_time(pid: u32) -> Option<u64> {
         let mut exit_t: FILETIME = std::mem::zeroed();
         let mut kernel: FILETIME = std::mem::zeroed();
         let mut user: FILETIME = std::mem::zeroed();
-        let ok = GetProcessTimes(
-            process,
-            &mut creation,
-            &mut exit_t,
-            &mut kernel,
-            &mut user,
-        );
+        let ok = GetProcessTimes(process, &mut creation, &mut exit_t, &mut kernel, &mut user);
         CloseHandle(process);
         if ok == 0 {
             None
@@ -307,25 +344,40 @@ pub fn process_creation_time(pid: u32) -> Option<u64> {
 }
 
 pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
-    let wide_path: Vec<u16> = dll_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide_path: Vec<u16> = dll_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let bytes_len = wide_path.len() * std::mem::size_of::<u16>();
 
     unsafe {
         let process: HANDLE = OpenProcess(
-            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ,
             0,
             pid,
         );
 
         if process.is_null() {
-            return Err(format!("Could not open process {} (error {})", pid, GetLastError()));
+            return Err(format!(
+                "Could not open process {} (error {})",
+                pid,
+                GetLastError()
+            ));
         }
 
         // Architecture check: 64-bit DLL cannot be injected into 32-bit (WOW64) process
         let mut is_wow64: i32 = 0;
         if IsWow64Process(process, &mut is_wow64) != 0 && is_wow64 != 0 {
             CloseHandle(process);
-            return Err(format!("Skipping 32-bit (WOW64) process (PID {}) - incompatible with 64-bit DLL", pid));
+            return Err(format!(
+                "Skipping 32-bit (WOW64) process (PID {}) - incompatible with 64-bit DLL",
+                pid
+            ));
         }
 
         let remote_mem = VirtualAllocEx(
@@ -338,7 +390,10 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
 
         if remote_mem.is_null() {
             CloseHandle(process);
-            return Err(format!("VirtualAllocEx failed in target process (error {})", GetLastError()));
+            return Err(format!(
+                "VirtualAllocEx failed in target process (error {})",
+                GetLastError()
+            ));
         }
 
         let mut written: usize = 0;
@@ -353,10 +408,16 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
         if ok_write == 0 {
             VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
             CloseHandle(process);
-            return Err(format!("WriteProcessMemory failed (error {})", GetLastError()));
+            return Err(format!(
+                "WriteProcessMemory failed (error {})",
+                GetLastError()
+            ));
         }
 
-        let kernel32_name: Vec<u16> = OsStr::new("kernel32.dll").encode_wide().chain(std::iter::once(0)).collect();
+        let kernel32_name: Vec<u16> = OsStr::new("kernel32.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let kernel32 = GetModuleHandleW(kernel32_name.as_ptr());
         let load_library_w = GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr());
 
@@ -370,7 +431,10 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
             process,
             null_mut(),
             0,
-            Some(std::mem::transmute(load_library_w)),
+            Some(std::mem::transmute::<
+                Option<unsafe extern "system" fn() -> isize>,
+                unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+            >(load_library_w)),
             remote_mem,
             0,
             null_mut(),
@@ -379,7 +443,10 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
         if thread.is_null() {
             VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
             CloseHandle(process);
-            return Err(format!("CreateRemoteThread failed (error {})", GetLastError()));
+            return Err(format!(
+                "CreateRemoteThread failed (error {})",
+                GetLastError()
+            ));
         }
 
         let wait_res = WaitForSingleObject(thread, 3000);
@@ -409,7 +476,10 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
             }
             None => {
                 if exit_code == 0 {
-                    return Err(format!("LoadLibraryW returned NULL in PID {} (injection failed)", pid));
+                    return Err(format!(
+                        "LoadLibraryW returned NULL in PID {} (injection failed)",
+                        pid
+                    ));
                 }
             }
         }
@@ -475,20 +545,28 @@ pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<LaunchOutcome, 
         .file_name()
         .map(|f| f.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let wide_exe: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide_exe: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let parent_dir = exe.parent().unwrap_or(Path::new("."));
-    let wide_dir: Vec<u16> = parent_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide_dir: Vec<u16> = parent_dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     // For Chromium browsers (exact file names only), add flags to allow DLL
     // injection and bypass the system proxy directly. This weakens the
     // browser sandbox and is disclosed in the UI status after launch.
-    let is_chromium = matches!(
-        exe_name.as_str(),
-        "chrome.exe" | "msedge.exe" | "brave.exe"
-    );
+    let is_chromium = matches!(exe_name.as_str(), "chrome.exe" | "msedge.exe" | "brave.exe");
     let make_cmd_line = || -> Vec<u16> {
         let cmd_str = if is_chromium {
-            format!("\"{}\" --disable-features=RendererCodeIntegrity --no-proxy-server", exe.display())
+            format!(
+                "\"{}\" --disable-features=RendererCodeIntegrity --no-proxy-server",
+                exe.display()
+            )
         } else {
             format!("\"{}\"", exe.display())
         };
@@ -545,7 +623,10 @@ pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<LaunchOutcome, 
     };
 
     if success == 0 {
-        return Err(format!("Failed to start application (Win32 error {})", unsafe { GetLastError() }));
+        return Err(format!(
+            "Failed to start application (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
     }
 
     let pid = pi.dwProcessId;
@@ -596,7 +677,11 @@ pub fn find_pids_by_exe_name(exe_name: &str) -> Vec<u32> {
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
                 let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len())],
+                    &entry.szExeFile[..entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len())],
                 );
                 if name.to_ascii_lowercase() == lower_target {
                     pids.push(entry.th32ProcessID);
@@ -659,8 +744,14 @@ pub fn resolve_executable_path(name: &str) -> Option<String> {
     }
 
     // 1. Check Windows App Paths in HKLM and HKCU
-    for hive in [winreg::enums::HKEY_LOCAL_MACHINE, winreg::enums::HKEY_CURRENT_USER] {
-        let key_path = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}", name);
+    for hive in [
+        winreg::enums::HKEY_LOCAL_MACHINE,
+        winreg::enums::HKEY_CURRENT_USER,
+    ] {
+        let key_path = format!(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}",
+            name
+        );
         if let Ok(key) = winreg::RegKey::predef(hive).open_subkey(&key_path) {
             if let Ok(val) = key.get_value::<String, _>("") {
                 let clean = val.trim().trim_matches('"');
@@ -716,12 +807,18 @@ pub fn get_process_full_path(pid: u32) -> Option<String> {
     None
 }
 
-pub fn get_process_maps() -> (
+/// (basename -> PIDs, PID -> parent PID, PID -> full executable path).
+/// The basename map exists for discovery; status decisions must use the
+/// full-path map, never the basename map.
+pub type ProcessMaps = (
     std::collections::HashMap<String, Vec<u32>>,
     std::collections::HashMap<u32, u32>,
     std::collections::HashMap<u32, String>,
-) {
-    let mut name_map: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
+);
+
+pub fn get_process_maps() -> ProcessMaps {
+    let mut name_map: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
     let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut paths: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
@@ -737,13 +834,18 @@ pub fn get_process_maps() -> (
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
                 let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len())],
+                    &entry.szExeFile[..entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len())],
                 );
                 let pid = entry.th32ProcessID;
                 let parent_pid = entry.th32ParentProcessID;
 
                 if pid > 4 {
-                    name_map.entry(name.to_ascii_lowercase())
+                    name_map
+                        .entry(name.to_ascii_lowercase())
                         .or_default()
                         .push(pid);
 
@@ -788,21 +890,34 @@ pub fn get_running_gui_processes() -> Vec<(u32, String, String)> {
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
                 let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len())],
+                    &entry.szExeFile[..entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len())],
                 );
                 let pid = entry.th32ProcessID;
 
                 // Filter out system internal OS processes
                 let lower = name.to_ascii_lowercase();
                 let skip = [
-                    "system", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
-                    "lsass.exe", "fontdrvhost.exe", "winlogon.exe",
-                    "dwm.exe", "sihost.exe", "taskhostw.exe", "biflow.exe"
+                    "system",
+                    "smss.exe",
+                    "csrss.exe",
+                    "wininit.exe",
+                    "services.exe",
+                    "lsass.exe",
+                    "fontdrvhost.exe",
+                    "winlogon.exe",
+                    "dwm.exe",
+                    "sihost.exe",
+                    "taskhostw.exe",
+                    "biflow.exe",
                 ];
 
                 if !skip.contains(&lower.as_str()) && lower.ends_with(".exe") && pid > 4 {
-                    let full_path = get_process_full_path(pid)
-                        .or_else(|| resolve_executable_path(&name));
+                    let full_path =
+                        get_process_full_path(pid).or_else(|| resolve_executable_path(&name));
 
                     if let Some(path) = full_path {
                         if Path::new(&path).is_absolute() {
@@ -822,7 +937,7 @@ pub fn get_running_gui_processes() -> Vec<(u32, String, String)> {
 
     // De-duplicate by full path (not by file name): the same exe name in two
     // different folders is two different applications.
-    procs.sort_by(|a, b| a.2.to_ascii_lowercase().cmp(&b.2.to_ascii_lowercase()));
+    procs.sort_by_key(|a| a.2.to_ascii_lowercase());
     procs.dedup_by(|a, b| a.2.eq_ignore_ascii_case(&b.2));
     procs
 }
