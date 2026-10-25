@@ -35,13 +35,11 @@ jobs:
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Check formatting (informational)
-        continue-on-error: true
+      - name: Check formatting
         run: cargo fmt --check
 
-      - name: Clippy (informational)
-        continue-on-error: true
-        run: cargo clippy --locked -- -D warnings
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Unit Tests
         run: cargo test --locked --verbose
