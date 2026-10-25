@@ -23,9 +23,13 @@ pub fn discover() -> Vec<AppEntry> {
         ];
 
         for base_path in paths {
-            let Ok(base) = hive.open_subkey(base_path) else { continue; };
+            let Ok(base) = hive.open_subkey(base_path) else {
+                continue;
+            };
             for key_name in base.enum_keys().flatten() {
-                let Ok(key) = base.open_subkey(&key_name) else { continue; };
+                let Ok(key) = base.open_subkey(&key_name) else {
+                    continue;
+                };
 
                 let name: String = key.get_value("DisplayName").unwrap_or_default();
                 if name.trim().is_empty() {
@@ -36,7 +40,12 @@ pub fn discover() -> Vec<AppEntry> {
                 let mut executable = String::new();
                 let icon: String = key.get_value("DisplayIcon").unwrap_or_default();
                 if !icon.is_empty() {
-                    let clean = icon.split(',').next().unwrap_or("").trim().trim_matches('"');
+                    let clean = icon
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches('"');
                     if clean.to_ascii_lowercase().ends_with(".exe") && Path::new(clean).exists() {
                         executable = clean.to_string();
                     }
@@ -56,13 +65,24 @@ pub fn discover() -> Vec<AppEntry> {
                                 let mut candidates: Vec<std::path::PathBuf> = Vec::new();
                                 for entry in entries.flatten() {
                                     let p = entry.path();
-                                    if p.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("exe")) {
-                                        let file_stem = p.file_stem().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+                                    if p.extension()
+                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                                    {
+                                        let file_stem = p
+                                            .file_stem()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_ascii_lowercase();
                                         // Skip uninstallers, installers, updaters,
                                         // crash reporters and redistributables.
                                         const SKIP: &[&str] = &[
-                                            "unins", "setup", "update", "crashpad",
-                                            "vc_redist", "redist", "installer",
+                                            "unins",
+                                            "setup",
+                                            "update",
+                                            "crashpad",
+                                            "vc_redist",
+                                            "redist",
+                                            "installer",
                                         ];
                                         if !SKIP.iter().any(|s| file_stem.contains(s)) {
                                             candidates.push(p);
@@ -127,7 +147,9 @@ pub fn discover() -> Vec<AppEntry> {
         let app_paths_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
         if let Ok(base) = hive.open_subkey(app_paths_key) {
             for key_name in base.enum_keys().flatten() {
-                let Ok(key) = base.open_subkey(&key_name) else { continue; };
+                let Ok(key) = base.open_subkey(&key_name) else {
+                    continue;
+                };
                 let exe_val: String = key.get_value("").unwrap_or_default();
                 let clean = exe_val.trim().trim_matches('"');
                 if clean.to_ascii_lowercase().ends_with(".exe") && Path::new(clean).exists() {
