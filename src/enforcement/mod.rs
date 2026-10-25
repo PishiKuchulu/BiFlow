@@ -1,7 +1,7 @@
 use crate::{config, models::InterfaceInfo, windows::injector};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -41,27 +41,49 @@ pub enum BypassLiveStatus {
     Failed,
 }
 
+/// Snapshot of enforcement state for one watchdog cycle. Cloned under
+/// a short lock so the blocking injection work (remote-thread waits,
+/// hook-status waits) happens WITHOUT holding the manager mutex: UI
+/// status reads must never queue behind an injection.
+pub struct WatchdogSnapshot {
+    pub entries: Vec<ActiveBypass>,
+}
+
+/// Per-entry plan computed from a snapshot + process maps (no locks,
+/// no injection): which PIDs are current, which injected PIDs survive,
+/// which PIDs still need injection.
+pub struct WatchdogPlanEntry {
+    pub app_id: Uuid,
+    pub pruned_injected: HashMap<u32, u64>,
+    pub had_pids: bool,
+    pub to_inject: Vec<u32>,
+}
+
 #[derive(Debug, Default)]
 pub struct EnforcementManager {
     pub active: HashMap<Uuid, ActiveBypass>,
     target_ip: Option<String>,
+    /// Consecutive watchdog cycles that saw no usable direct adapter IPv4.
+    /// After two cycles the policy is fail-closed (see watchdog_commit).
+    adapter_missing_cycles: u32,
 }
 
 impl EnforcementManager {
     /// Writes the target-IP file and the bypassed-apps allow-list so the
     /// injected hook DLLs pick up the current policy (or its removal).
     /// When nothing is active, all policy files are deleted, which the hook
-    /// interprets as "bypass disabled".
-    fn sync_policy_files(&self) {
+    /// interprets as "bypass disabled". Failures are returned: a caller
+    /// must never treat a bypass as live when its policy was not published.
+    fn sync_policy_files(&self) -> Result<(), String> {
         match &self.target_ip {
             Some(ip) if !self.active.is_empty() => {
-                let _ = injector::update_target_ip(ip);
+                injector::update_target_ip(ip)?;
                 let paths: Vec<String> = self
                     .active
                     .values()
                     .map(|b| b.exe_path.to_string_lossy().to_string())
                     .collect();
-                injector::update_bypass_app_list(&paths);
+                injector::update_bypass_app_list(&paths)
             }
             _ => injector::clear_target_ip(),
         }
@@ -79,6 +101,7 @@ impl EnforcementManager {
             .ok_or("Direct interface has no valid IPv4 address")?;
 
         let dll_path = injector::ensure_dll_extracted()?;
+        let prev_ip = self.target_ip.clone();
         self.target_ip = Some(source_ip);
 
         let exe_name = exe
@@ -112,8 +135,7 @@ impl EnforcementManager {
                     }
                 }
                 if injected_pids.is_empty() {
-                    inject_error =
-                        last_err.or_else(|| Some("DLL injection failed".into()));
+                    inject_error = last_err.or_else(|| Some("DLL injection failed".into()));
                 }
             }
         }
@@ -129,7 +151,18 @@ impl EnforcementManager {
                 inject_error: inject_error.clone(),
             },
         );
-        self.sync_policy_files();
+        // Publish the policy before claiming success. On failure, roll the
+        // entry back and restore the previous policy so a half-published
+        // state can never masquerade as an active bypass.
+        if let Err(e) = self.sync_policy_files() {
+            self.active.remove(&app_id);
+            self.target_ip = prev_ip;
+            let _ = self.sync_policy_files();
+            return Err(format!(
+                "Bypass configured, but policy could not be published: {}",
+                e
+            ));
+        }
 
         config::append_log(&format!(
             "ENABLE_BYPASS app={} exe={} iface={} ip={} status={:?}",
@@ -142,7 +175,10 @@ impl EnforcementManager {
 
         if let Some(err) = inject_error {
             if !awaiting_process {
-                return Err(format!("Bypass configured, but live injection failed: {}", err));
+                return Err(format!(
+                    "Bypass configured, but live injection failed: {}",
+                    err
+                ));
             }
         }
 
@@ -152,7 +188,7 @@ impl EnforcementManager {
     pub fn launch(
         &mut self,
         app_id: Uuid,
-        exe: &PathBuf,
+        exe: &Path,
         direct: &InterfaceInfo,
     ) -> Result<(u32, bool), String> {
         let source_ip = direct
@@ -167,20 +203,28 @@ impl EnforcementManager {
 
         // Register the bypass and publish the policy files BEFORE the
         // process starts, so the hook DLL finds the allow-list (including
-        // this exe) the moment it initializes.
+        // this exe) the moment it initializes. A publication failure aborts
+        // the launch: starting the app without its policy would leave it
+        // running un-bypassed while the UI claimed a bypass launch.
+        let prev_ip = self.target_ip.clone();
         self.target_ip = Some(source_ip.clone());
         self.active.insert(
             app_id,
             ActiveBypass {
                 app_id,
-                exe_path: exe.clone(),
+                exe_path: exe.to_path_buf(),
                 exe_name: exe_name.clone(),
                 injected_pids: HashMap::new(),
                 awaiting_process: false,
                 inject_error: None,
             },
         );
-        self.sync_policy_files();
+        if let Err(e) = self.sync_policy_files() {
+            self.active.remove(&app_id);
+            self.target_ip = prev_ip;
+            let _ = self.sync_policy_files();
+            return Err(format!("Bypass policy could not be published: {}", e));
+        }
 
         let outcome = match injector::launch_with_bypass(exe, &source_ip) {
             Ok(o) => o,
@@ -189,19 +233,34 @@ impl EnforcementManager {
                 if self.active.is_empty() {
                     self.target_ip = None;
                 }
-                self.sync_policy_files();
+                let _ = self.sync_policy_files();
                 return Err(e);
             }
         };
 
         if let Some(entry) = self.active.get_mut(&app_id) {
-            entry
-                .injected_pids
-                .insert(outcome.pid, injector::process_creation_time(outcome.pid).unwrap_or(0));
+            entry.injected_pids.insert(
+                outcome.pid,
+                injector::process_creation_time(outcome.pid).unwrap_or(0),
+            );
             entry.awaiting_process = false;
             entry.inject_error = None;
         }
-        self.sync_policy_files();
+        // The process is already running at this point, so a sync failure
+        // cannot abort the launch; instead the policy is cleared (fail
+        // closed: the hook stops binding new sockets) and the error is
+        // reported while the entry is removed.
+        if let Err(e) = self.sync_policy_files() {
+            self.active.remove(&app_id);
+            if self.active.is_empty() {
+                self.target_ip = None;
+            }
+            let _ = self.sync_policy_files();
+            return Err(format!(
+                "Launched, but policy re-publication failed so the bypass was disabled: {}",
+                e
+            ));
+        }
 
         config::append_log(&format!(
             "LAUNCH_BYPASS app={} exe={} pid={} ip={} unelevated={}",
@@ -216,23 +275,40 @@ impl EnforcementManager {
     }
 
     pub fn remove(&mut self, app_id: Uuid) -> Result<(), String> {
-        if let Some(entry) = self.active.remove(&app_id) {
-            config::append_log(&format!("DISABLE_BYPASS app={} exe={}", app_id, entry.exe_name));
-        }
+        let removed = self.active.remove(&app_id);
+        let removed_name = removed.as_ref().map(|e| e.exe_name.clone());
+        let prev_ip = self.target_ip.clone();
         if self.active.is_empty() {
             self.target_ip = None;
         }
         // Rewrites the allow-list without the removed app so its injected
         // processes stop bypassing on new sockets; deletes everything when
-        // no bypass remains.
-        self.sync_policy_files();
+        // no bypass remains. On publication failure the removal is rolled
+        // back: the stale allow-list would otherwise keep bypassing an app
+        // the UI reports as disabled.
+        if let Err(e) = self.sync_policy_files() {
+            if let Some(entry) = removed {
+                self.active.insert(app_id, entry);
+            }
+            self.target_ip = prev_ip;
+            let _ = self.sync_policy_files();
+            return Err(format!("Bypass removal could not be published: {}", e));
+        }
+        if let Some(name) = removed_name {
+            config::append_log(&format!("DISABLE_BYPASS app={} exe={}", app_id, name));
+        }
         Ok(())
     }
 
     pub fn clear_all(&mut self) -> Result<(), String> {
-        self.active.clear();
-        self.target_ip = None;
-        self.sync_policy_files();
+        let prev_active = std::mem::take(&mut self.active);
+        let prev_ip = self.target_ip.take();
+        if let Err(e) = self.sync_policy_files() {
+            self.active = prev_active;
+            self.target_ip = prev_ip;
+            let _ = self.sync_policy_files();
+            return Err(format!("Bypass clear could not be published: {}", e));
+        }
         config::append_log("CLEAR_ALL_BYPASSES");
         Ok(())
     }
@@ -256,55 +332,23 @@ impl EnforcementManager {
         })
     }
 
-    pub fn inject_error(&self, app_id: Uuid) -> Option<String> {
-        self.active
-            .get(&app_id)
-            .and_then(|b| b.inject_error.clone())
-    }
-
     pub fn count(&self) -> usize {
         self.active.len()
     }
 
-    /// One watchdog cycle. Runs on a dedicated background thread (see
-    /// AppState), never on the UI thread, and keeps working while the
-    /// window is hidden in the tray.
-    ///
-    /// - Re-reads the selected adapter's current IPv4 and republishes the
-    ///   policy when it changed (DHCP renewal, Wi-Fi roaming), so injected
-    ///   hooks stop binding to a dead address.
-    /// - Injects processes whose exe path matches a bypassed app, plus
-    ///   their descendants that live in the same install directory tree
-    ///   (launcher helpers such as steamwebhelper.exe).
-    pub fn check_watchdog(&mut self, maps: &ProcessMaps, direct_ip: Option<&str>) {
-        if self.active.is_empty() {
-            return;
+    pub fn watchdog_snapshot(&self) -> WatchdogSnapshot {
+        WatchdogSnapshot {
+            entries: self.active.values().cloned().collect(),
         }
+    }
 
-        // Adapter IP drift: republish policy with the fresh address.
-        if let Some(ip) = direct_ip {
-            if self.target_ip.as_deref() != Some(ip) {
-                config::append_log(&format!(
-                    "ADAPTER_IP_CHANGED old={} new={}",
-                    self.target_ip.as_deref().unwrap_or("?"),
-                    ip
-                ));
-                self.target_ip = Some(ip.to_string());
-                self.sync_policy_files();
-            }
-        }
-
-        let dll_path = match injector::ensure_dll_extracted() {
-            Ok(p) => p,
-            Err(e) => {
-                config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
-                return;
-            }
-        };
-
+    pub fn watchdog_plan(
+        snapshot: &WatchdogSnapshot,
+        maps: &ProcessMaps,
+    ) -> Vec<WatchdogPlanEntry> {
         let (_names, parents, paths) = maps;
-
-        for bypass in self.active.values_mut() {
+        let mut out = Vec::new();
+        for bypass in &snapshot.entries {
             if bypass.exe_name.is_empty() {
                 continue;
             }
@@ -328,8 +372,7 @@ impl EnforcementManager {
                 let descendants: Vec<u32> = paths
                     .iter()
                     .filter(|(pid, p)| {
-                        !current.contains(pid)
-                            && p.to_ascii_lowercase().starts_with(&prefix)
+                        !current.contains(pid) && p.to_ascii_lowercase().starts_with(&prefix)
                     })
                     .map(|(pid, _)| *pid)
                     .filter(|pid| {
@@ -355,7 +398,8 @@ impl EnforcementManager {
 
             // Purge dead PIDs and entries whose creation time no longer
             // matches (the PID was recycled by a different process).
-            bypass.injected_pids.retain(|pid, created| {
+            let mut pruned = bypass.injected_pids.clone();
+            pruned.retain(|pid, created| {
                 if !current.contains(pid) {
                     return false;
                 }
@@ -366,30 +410,88 @@ impl EnforcementManager {
                     .map(|now| now == *created)
                     .unwrap_or(false)
             });
+            let to_inject: Vec<u32> = current
+                .iter()
+                .filter(|pid| !pruned.contains_key(pid))
+                .copied()
+                .collect();
+            out.push(WatchdogPlanEntry {
+                app_id: bypass.app_id,
+                pruned_injected: pruned,
+                had_pids: !current.is_empty(),
+                to_inject,
+            });
+        }
+        out
+    }
 
-            let had_pids = !current.is_empty();
-            let mut last_err: Option<String> = None;
-            for &pid in &current {
-                if !bypass.injected_pids.contains_key(&pid) {
-                    match injector::inject_dll_into_pid(pid, &dll_path) {
-                        Ok(_) => {
-                            bypass.injected_pids.insert(
-                                pid,
-                                injector::process_creation_time(pid).unwrap_or(0),
-                            );
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                        }
+    /// Commit a watchdog cycle under a short lock. `injected` maps app_id to
+    /// newly injected (pid, creation) pairs; `errors` maps app_id to the
+    /// last injection error. Also handles adapter-IP drift and adapter
+    /// loss: after two consecutive cycles with no usable direct IPv4, the
+    /// policy is fail-closed (files deleted, entries marked Failed) instead
+    /// of leaving injected processes bound to a stale address while the UI
+    /// still reports Live.
+    pub fn watchdog_commit(
+        &mut self,
+        plan: Vec<WatchdogPlanEntry>,
+        injected: &HashMap<Uuid, Vec<(u32, u64)>>,
+        errors: &HashMap<Uuid, String>,
+        direct_ip: Option<&str>,
+    ) {
+        match direct_ip {
+            Some(ip) => {
+                self.adapter_missing_cycles = 0;
+                if self.target_ip.as_deref() != Some(ip) {
+                    let prev = self.target_ip.clone();
+                    config::append_log(&format!(
+                        "ADAPTER_IP_CHANGED old={} new={}",
+                        prev.as_deref().unwrap_or("?"),
+                        ip
+                    ));
+                    self.target_ip = Some(ip.to_string());
+                    if let Err(e) = self.sync_policy_files() {
+                        config::append_log(&format!("ADAPTER_IP_PUBLISH_FAILED {}", e));
+                        self.target_ip = prev;
+                        let _ = self.sync_policy_files();
                     }
                 }
             }
+            None => {
+                self.adapter_missing_cycles += 1;
+                if self.adapter_missing_cycles >= 2 {
+                    config::append_log("ADAPTER_LOST policy fail-closed");
+                    self.target_ip = None;
+                    let _ = self.sync_policy_files();
+                    for bypass in self.active.values_mut() {
+                        bypass.injected_pids.clear();
+                        bypass.awaiting_process = false;
+                        bypass.inject_error =
+                            Some("Direct adapter unavailable; bypass suspended".into());
+                    }
+                    return;
+                }
+            }
+        }
 
+        for entry in plan {
+            let Some(bypass) = self.active.get_mut(&entry.app_id) else {
+                continue;
+            };
+            let mut injected_pids = entry.pruned_injected;
+            if let Some(new) = injected.get(&entry.app_id) {
+                for (pid, created) in new {
+                    injected_pids.insert(*pid, *created);
+                }
+            }
+            bypass.injected_pids = injected_pids;
             if bypass.injected_pids.is_empty() {
-                if had_pids {
+                if entry.had_pids {
                     bypass.awaiting_process = false;
-                    bypass.inject_error =
-                        last_err.or_else(|| Some("DLL injection failed".into()));
+                    bypass.inject_error = errors
+                        .get(&entry.app_id)
+                        .cloned()
+                        .or_else(|| Some("DLL injection failed".into()));
                 } else {
                     bypass.awaiting_process = true;
                     bypass.inject_error = None;
@@ -399,6 +501,28 @@ impl EnforcementManager {
                 bypass.inject_error = None;
             }
         }
+    }
+
+    /// One-shot status map for the UI: a single lock for a whole frame
+    /// instead of two locks per rendered row.
+    pub fn live_status_map(&self) -> HashMap<Uuid, (BypassLiveStatus, Option<String>)> {
+        self.active
+            .iter()
+            .map(|(id, b)| {
+                let status = if !b.injected_pids.is_empty() {
+                    BypassLiveStatus::Live
+                } else if b.awaiting_process {
+                    BypassLiveStatus::Pending
+                } else {
+                    BypassLiveStatus::Failed
+                };
+                (*id, (status, b.inject_error.clone()))
+            })
+            .collect()
+    }
+
+    pub fn active_ids(&self) -> HashSet<Uuid> {
+        self.active.keys().copied().collect()
     }
 }
 
