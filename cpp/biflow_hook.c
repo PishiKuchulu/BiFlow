@@ -10,7 +10,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-// BiFlow Winsock hook DLL (v0.3.0).
+// BiFlow Winsock hook DLL (v0.3.1).
 //
 // Strategy: outbound client sockets are bound to the IPv4 address of the
 // physical ("direct") adapter BiFlow selected. On Windows, binding a socket to
@@ -20,13 +20,22 @@
 // Policy distribution (written by the elevated BiFlow process, read here):
 //   1. %ProgramData%\BiFlow\target_ip.txt    -> target IPv4 (one line)
 //   2. %ProgramData%\BiFlow\bypass_apps.txt  -> allowed exe paths (UTF-8, one per line)
-//   3. %TEMP%\biflow_target_ip.txt           -> legacy fallback, only when (1) is absent
-//   4. %TEMP%\BiFlow\bypass_apps.txt         -> legacy fallback, only when (2) is absent
 //
-// The ProgramData copies live in a directory whose DACL (set by BiFlow) grants
-// write access only to SYSTEM and Administrators, and they are authoritative:
-// the %TEMP% fallbacks can no longer override them. BIFLOW_TARGET_IP is NOT
+// ProgramData is the ONLY policy location: the old %TEMP% fallbacks were
+// removed because a stale TEMP copy could resurrect a deleted policy and
+// because TEMP was never protected by the admin-only DACL. A missing
+// allow-list is now fail-closed (bypass off), not permissive: BiFlow always
+// writes both files together, so a missing list means the policy was
+// deleted, not that it predates allow-lists. BIFLOW_TARGET_IP is NOT
 // consulted anymore (it leaked into unrelated child processes of BiFlow).
+//
+// Known bind limitation: Hook_bind redirects an INADDR_ANY:0 TCP bind to
+// the physical IP because ConnectEx-style clients must be bound before
+// they connect, and bind time is the only moment the source can be chosen.
+// A socket that later calls listen() therefore listens on the physical IP
+// only instead of all interfaces. This is inherent to the Winsock hook
+// layer (there is no unbind, and a ConnectEx wrapper cannot rebind an
+// already-bound socket); servers that bind an explicit port are unaffected.
 //
 // The hook re-validates the policy at most every 250 ms by fingerprinting the
 // policy files (last-write times). Deleting the files (BiFlow "Disable All" /
@@ -67,10 +76,11 @@ static pfn_WSASendTo g_real_WSASendTo = NULL;
 static pfn_bind g_real_bind = NULL;
 
 // Policy file paths, built once by the init thread before hooks are enabled.
+// Only ProgramData paths exist for policy now; the status file falls back
+// to TEMP only when ProgramData itself is unavailable (it is a report, not
+// policy, and is never read as policy).
 static wchar_t g_path_target_pd[1024];
 static wchar_t g_path_apps_pd[1024];
-static wchar_t g_path_target_tmp[1024];
-static wchar_t g_path_apps_tmp[1024];
 static wchar_t g_path_status[1024];
 
 // Cached policy, guarded by g_policy_lock. g_target_ip == 0 means "bypass
@@ -120,8 +130,6 @@ static void build_policy_paths(void) {
 
   g_path_target_pd[0] = L'\0';
   g_path_apps_pd[0] = L'\0';
-  g_path_target_tmp[0] = L'\0';
-  g_path_apps_tmp[0] = L'\0';
   g_path_status[0] = L'\0';
 
   if (GetEnvironmentVariableW(L"ProgramData", prog, 1024) > 0) {
@@ -132,25 +140,18 @@ static void build_policy_paths(void) {
     _snwprintf_s(g_path_status, 1024, _TRUNCATE,
                  L"%s\\BiFlow\\hook_status_%lu.txt", prog, (unsigned long)pid);
   }
-  if (GetTempPathW(1024, tmp) > 0) {
-    _snwprintf_s(g_path_target_tmp, 1024, _TRUNCATE, L"%sbiflow_target_ip.txt",
-                 tmp);
-    _snwprintf_s(g_path_apps_tmp, 1024, _TRUNCATE,
-                 L"%sBiFlow\\bypass_apps.txt", tmp);
-    if (g_path_status[0] == L'\0') {
-      _snwprintf_s(g_path_status, 1024, _TRUNCATE,
-                   L"%sBiFlow\\hook_status_%lu.txt", tmp, (unsigned long)pid);
-    }
+  if (g_path_status[0] == L'\0' && GetTempPathW(1024, tmp) > 0) {
+    _snwprintf_s(g_path_status, 1024, _TRUNCATE,
+                 L"%sBiFlow\\hook_status_%lu.txt", tmp, (unsigned long)pid);
   }
 }
 
 // Fingerprint of all policy files (last-write times). 0 when none exist.
 // Cheap: one GetFileAttributesExW per policy file.
 static uint64_t policy_files_tick(void) {
-  const wchar_t *paths[4] = {g_path_target_pd, g_path_apps_pd,
-                             g_path_target_tmp, g_path_apps_tmp};
+  const wchar_t *paths[2] = {g_path_target_pd, g_path_apps_pd};
   uint64_t tick = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 2; i++) {
     if (paths[i][0] == L'\0')
       continue;
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -177,69 +178,59 @@ static int read_small_file(const wchar_t *path, char *buf, int buf_size) {
 
 static uint32_t load_target_ip_from_files(void) {
   char buf[256];
-  // ProgramData (admin-only) first, TEMP only as a legacy fallback.
-  const wchar_t *paths[2] = {g_path_target_pd, g_path_target_tmp};
-  for (int i = 0; i < 2; i++) {
-    if (paths[i][0] == L'\0')
-      continue;
-    if (read_small_file(paths[i], buf, sizeof(buf)) > 0) {
-      uint32_t ip = parse_ip_string(buf);
-      if (ip != 0)
-        return ip;
-    }
+  // ProgramData only, and only when it parses: an invalid ProgramData
+  // file must NOT fall through to any stale copy anywhere else.
+  if (g_path_target_pd[0] != L'\0' &&
+      read_small_file(g_path_target_pd, buf, sizeof(buf)) > 0) {
+    return parse_ip_string(buf);
   }
   return 0;
 }
 
 // Returns 1 when this process's executable is listed in bypass_apps.txt.
-// Missing list file => permissive (1), for forward compatibility.
-// The list is UTF-8 text written by BiFlow; it is decoded to wide chars and
-// compared against the wide module path, so non-ASCII paths match correctly.
+// Fail-closed: a missing list means the policy was deleted (BiFlow always
+// writes both policy files together), so bypass is off. The list is UTF-8
+// text written by BiFlow; it is decoded to wide chars and compared against
+// the wide module path, so non-ASCII paths match correctly.
 static int load_this_exe_allowed(void) {
   wchar_t self[1024];
   DWORD n = GetModuleFileNameW(NULL, self, 1024);
   if (n == 0 || n >= 1024)
-    return 1;
+    return 0;
 
   static char raw[64 * 1024];
   static wchar_t wide[64 * 1024];
-  const wchar_t *paths[2] = {g_path_apps_pd, g_path_apps_tmp};
-  for (int i = 0; i < 2; i++) {
-    if (paths[i][0] == L'\0')
-      continue;
-    int len = read_small_file(paths[i], raw, sizeof(raw));
-    if (len < 0)
-      continue; // No list at this location; try the fallback.
-    // A list file exists here and is authoritative for this check.
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, raw, len, wide,
-                                   (int)(sizeof(wide) / sizeof(wide[0])) - 1);
-    if (wlen <= 0)
-      return 0;
-    wide[wlen] = L'\0';
-    wchar_t *line = wide;
-    while (line && *line) {
-      wchar_t *eol = wcschr(line, L'\n');
-      if (eol)
-        *eol = L'\0';
-      // Trim trailing CR / spaces / tabs
-      size_t llen = wcslen(line);
-      while (llen > 0 && (line[llen - 1] == L'\r' || line[llen - 1] == L' ' ||
-                         line[llen - 1] == L'\t')) {
-        line[--llen] = L'\0';
-      }
-      // Trim leading spaces / tabs
-      while (*line == L' ' || *line == L'\t')
-        line++;
-      if (llen > 0 && _wcsicmp(line, self) == 0) {
-        return 1;
-      }
-      line = eol ? eol + 1 : NULL;
-    }
-    // List exists and we are not on it: this app's bypass was removed.
+  if (g_path_apps_pd[0] == L'\0')
     return 0;
+  int len = read_small_file(g_path_apps_pd, raw, sizeof(raw));
+  if (len < 0)
+    return 0; // No list: policy deleted, bypass off.
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, raw, len, wide,
+                                 (int)(sizeof(wide) / sizeof(wide[0])) - 1);
+  if (wlen <= 0)
+    return 0;
+  wide[wlen] = L'\0';
+  wchar_t *line = wide;
+  while (line && *line) {
+    wchar_t *eol = wcschr(line, L'\n');
+    if (eol)
+      *eol = L'\0';
+    // Trim trailing CR / spaces / tabs
+    size_t llen = wcslen(line);
+    while (llen > 0 && (line[llen - 1] == L'\r' || line[llen - 1] == L' ' ||
+                       line[llen - 1] == L'\t')) {
+      line[--llen] = L'\0';
+    }
+    // Trim leading spaces / tabs
+    while (*line == L' ' || *line == L'\t')
+      line++;
+    if (llen > 0 && _wcsicmp(line, self) == 0) {
+      return 1;
+    }
+    line = eol ? eol + 1 : NULL;
   }
-  // No list anywhere: permissive.
-  return 1;
+  // List exists and we are not on it: this app's bypass was removed.
+  return 0;
 }
 
 // Re-read policy when BiFlow changed or deleted the policy files.
@@ -319,16 +310,27 @@ static void bind_socket_if_needed(SOCKET s, const struct sockaddr_in *dest) {
   }
 }
 
+// True only for a complete IPv4 address: reading sa_family needs at
+// least 2 bytes, and reading sin_addr needs the full sockaddr_in. Callers
+// must never cast a short sockaddr to sockaddr_in (that was a real
+// over-read: the connect/sendto hooks used to check only sa_family).
+static int addr_is_full_ipv4(const struct sockaddr *name, int namelen) {
+  return name && namelen >= 2 && name->sa_family == AF_INET &&
+         namelen >= (int)sizeof(struct sockaddr_in);
+}
+
 static int WSAAPI Hook_bind(SOCKET s, const struct sockaddr *name,
                             int namelen) {
   uint32_t target_ip = 0;
-  if (policy_active_snapshot(&target_ip) && name &&
-      namelen >= (int)sizeof(struct sockaddr_in)) {
+  if (policy_active_snapshot(&target_ip) &&
+      addr_is_full_ipv4(name, namelen)) {
     const struct sockaddr_in *in = (const struct sockaddr_in *)name;
     // Only redirect outbound client sockets that bind to INADDR_ANY on port 0
     // (used by asynchronous APIs such as ConnectEx). UDP sockets are left
     // alone here (their bypass happens in sendto/WSASendTo) so UDP listeners
     // and discovery sockets keep working on all interfaces.
+    // NOTE: a socket that later calls listen() keeps this redirected bind
+    // (see the file header); servers binding an explicit port are unaffected.
     if (in->sin_family == AF_INET && in->sin_addr.s_addr == INADDR_ANY &&
         in->sin_port == 0) {
       int sock_type = 0;
@@ -360,7 +362,7 @@ static int WSAAPI Hook_bind(SOCKET s, const struct sockaddr *name,
 
 static int WSAAPI Hook_connect(SOCKET s, const struct sockaddr *name,
                                int namelen) {
-  if (name && name->sa_family == AF_INET) {
+  if (addr_is_full_ipv4(name, namelen)) {
     bind_socket_if_needed(s, (const struct sockaddr_in *)name);
   }
   if (g_real_connect) {
@@ -373,7 +375,7 @@ static int WSAAPI Hook_WSAConnect(SOCKET s, const struct sockaddr *name,
                                   int namelen, LPWSABUF lpCallerData,
                                   LPWSABUF lpCalleeData, LPQOS lpSQOS,
                                   LPQOS lpGQOS) {
-  if (name && name->sa_family == AF_INET) {
+  if (addr_is_full_ipv4(name, namelen)) {
     bind_socket_if_needed(s, (const struct sockaddr_in *)name);
   }
   if (g_real_WSAConnect) {
@@ -386,7 +388,7 @@ static int WSAAPI Hook_WSAConnect(SOCKET s, const struct sockaddr *name,
 
 static int WSAAPI Hook_sendto(SOCKET s, const char *buf, int len, int flags,
                               const struct sockaddr *to, int tolen) {
-  if (to && to->sa_family == AF_INET) {
+  if (addr_is_full_ipv4(to, tolen)) {
     bind_socket_if_needed(s, (const struct sockaddr_in *)to);
   } else if (!to) {
     bind_socket_if_needed(s, NULL);
@@ -404,7 +406,7 @@ static int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF lpBuffers,
                                  LPWSAOVERLAPPED lpOverlapped,
                                  LPWSAOVERLAPPED_COMPLETION_ROUTINE
                                      lpCompletionRoutine) {
-  if (lpTo && lpTo->sa_family == AF_INET) {
+  if (addr_is_full_ipv4(lpTo, iToLen)) {
     bind_socket_if_needed(s, (const struct sockaddr_in *)lpTo);
   } else if (!lpTo) {
     bind_socket_if_needed(s, NULL);
