@@ -1,9 +1,5 @@
 use crate::models::Store;
-use std::{
-    fs, io,
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{fs, io, path::PathBuf, sync::OnceLock};
 
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -98,7 +94,11 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 fn format_timestamp_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let secs_of_day = secs % 86_400;
-    let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (hh, mm, ss) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
     // Howard Hinnant's civil-from-days algorithm.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -147,6 +147,9 @@ mod tests {
     fn timestamp_format_is_human_readable() {
         assert_eq!(format_timestamp_utc(0), "1970-01-01 00:00:00 UTC");
         // 2026-10-23 11:45:00 UTC
-        assert_eq!(format_timestamp_utc(1_792_755_900), "2026-10-23 11:45:00 UTC");
+        assert_eq!(
+            format_timestamp_utc(1_792_755_900),
+            "2026-10-23 11:45:00 UTC"
+        );
     }
 }
