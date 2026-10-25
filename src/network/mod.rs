@@ -150,7 +150,8 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
         )
     };
 
-    if ret == 111 { // ERROR_BUFFER_OVERFLOW
+    if ret == 111 {
+        // ERROR_BUFFER_OVERFLOW
         buf.resize(buf_len as usize, 0);
         ret = unsafe {
             GetAdaptersAddresses(
@@ -164,7 +165,10 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
     }
 
     if ret != 0 {
-        return Err(format!("GetAdaptersAddresses failed with error code {}", ret));
+        return Err(format!(
+            "GetAdaptersAddresses failed with error code {}",
+            ret
+        ));
     }
 
     let mut out = Vec::new();
@@ -176,7 +180,9 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
         // Friendly name
         let name = if !adapter.FriendlyName.is_null() {
             let mut len = 0;
-            while unsafe { *adapter.FriendlyName.add(len) } != 0 { len += 1; }
+            while unsafe { *adapter.FriendlyName.add(len) } != 0 {
+                len += 1;
+            }
             let slice = unsafe { std::slice::from_raw_parts(adapter.FriendlyName, len) };
             String::from_utf16_lossy(slice)
         } else {
@@ -186,7 +192,9 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
         // Description
         let description = if !adapter.Description.is_null() {
             let mut len = 0;
-            while unsafe { *adapter.Description.add(len) } != 0 { len += 1; }
+            while unsafe { *adapter.Description.add(len) } != 0 {
+                len += 1;
+            }
             let slice = unsafe { std::slice::from_raw_parts(adapter.Description, len) };
             String::from_utf16_lossy(slice)
         } else {
@@ -275,7 +283,7 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
         curr = adapter.Next;
     }
 
-    out.sort_by(|a, b| a.index.cmp(&b.index));
+    out.sort_by_key(|a| a.index);
     Ok(out)
 }
 
@@ -290,12 +298,31 @@ pub fn is_apipa_ipv4(ip: &str) -> bool {
 pub fn is_likely_vpn(i: &InterfaceInfo) -> bool {
     let s = format!("{} {}", i.name, i.description).to_ascii_lowercase();
     let substring_keywords = [
-        "wireguard", "wintun", "openvpn", "tailscale",
-        "warp", "vpn", "fortinet", "cisco", "hamachi", "zerotier",
-        "v2ray", "xray", "sing-box", "nekoray", "clash", "hiddify",
+        "wireguard",
+        "wintun",
+        "openvpn",
+        "tailscale",
+        "warp",
+        "vpn",
+        "fortinet",
+        "cisco",
+        "hamachi",
+        "zerotier",
+        "v2ray",
+        "xray",
+        "sing-box",
+        "nekoray",
+        "clash",
+        "hiddify",
         // Virtual / non-physical adapters that are never the "direct" uplink:
-        "hyper-v", "vethernet", "vmware", "virtualbox", "virtual",
-        "bluetooth", "loopback", "pseudo",
+        "hyper-v",
+        "vethernet",
+        "vmware",
+        "virtualbox",
+        "virtual",
+        "bluetooth",
+        "loopback",
+        "pseudo",
     ];
     if substring_keywords.iter().any(|k| s.contains(k)) {
         return true;
@@ -327,23 +354,55 @@ mod tests {
 
     #[test]
     fn vpn_heuristic_detects_tunnels() {
-        assert!(is_likely_vpn(&iface("WireGuard Tunnel", "Wintun Userspace Tunnel", false)));
-        assert!(is_likely_vpn(&iface("Ethernet", "TAP-Windows Adapter V9", false)));
+        assert!(is_likely_vpn(&iface(
+            "WireGuard Tunnel",
+            "Wintun Userspace Tunnel",
+            false
+        )));
+        assert!(is_likely_vpn(&iface(
+            "Ethernet",
+            "TAP-Windows Adapter V9",
+            false
+        )));
         assert!(is_likely_vpn(&iface("Local Area Connection", "", true)));
     }
 
     #[test]
     fn vpn_heuristic_keeps_physical_adapters() {
-        assert!(!is_likely_vpn(&iface("Wi-Fi", "Intel(R) Wi-Fi 6 AX201", false)));
-        assert!(!is_likely_vpn(&iface("Ethernet", "Realtek PCIe GbE", false)));
-        assert!(!is_likely_vpn(&iface("Ethernet 2", "Realtek USB GbE Family Controller", false)));
+        assert!(!is_likely_vpn(&iface(
+            "Wi-Fi",
+            "Intel(R) Wi-Fi 6 AX201",
+            false
+        )));
+        assert!(!is_likely_vpn(&iface(
+            "Ethernet",
+            "Realtek PCIe GbE",
+            false
+        )));
+        assert!(!is_likely_vpn(&iface(
+            "Ethernet 2",
+            "Realtek USB GbE Family Controller",
+            false
+        )));
     }
 
     #[test]
     fn vpn_heuristic_flags_virtual_adapters() {
-        assert!(is_likely_vpn(&iface("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter", false)));
-        assert!(is_likely_vpn(&iface("VMware Network Adapter VMnet8", "VMware Virtual Ethernet Adapter", false)));
-        assert!(is_likely_vpn(&iface("Bluetooth Network Connection", "Bluetooth Device (Personal Area Network)", false)));
+        assert!(is_likely_vpn(&iface(
+            "vEthernet (WSL)",
+            "Hyper-V Virtual Ethernet Adapter",
+            false
+        )));
+        assert!(is_likely_vpn(&iface(
+            "VMware Network Adapter VMnet8",
+            "VMware Virtual Ethernet Adapter",
+            false
+        )));
+        assert!(is_likely_vpn(&iface(
+            "Bluetooth Network Connection",
+            "Bluetooth Device (Personal Area Network)",
+            false
+        )));
     }
 
     #[test]
