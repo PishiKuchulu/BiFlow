@@ -38,7 +38,6 @@ pub struct AppState {
     pub filter_net_only: bool,
     pub filter_bypassed_only: bool,
     pub filter_blocked_only: bool,
-    pub running_processes: HashMap<String, Vec<u32>>,
     pub process_parents: HashMap<u32, u32>,
     pub pid_to_path: HashMap<u32, String>,
     pub active_network_pids: HashSet<u32>,
@@ -52,16 +51,43 @@ impl AppState {
         self.manager.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn live_status(&self, app_id: Uuid) -> Option<crate::enforcement::BypassLiveStatus> {
-        self.manager().live_status(app_id)
+    /// One-shot status map for a whole UI frame (one lock instead of two
+    /// locks per rendered row).
+    pub fn live_status_map(
+        &self,
+    ) -> HashMap<Uuid, (crate::enforcement::BypassLiveStatus, Option<String>)> {
+        self.manager().live_status_map()
     }
 
-    pub fn inject_error(&self, app_id: Uuid) -> Option<String> {
-        self.manager().inject_error(app_id)
+    pub fn active_bypass_ids(&self) -> HashSet<Uuid> {
+        self.manager().active_ids()
     }
 
     pub fn active_bypass_count(&self) -> usize {
         self.manager().count()
+    }
+
+    /// Paused means "the active profile has enabled rules that are not
+    /// currently enforced". Recomputed after every change instead of being
+    /// cleared by a single toggle, so enabling one app while paused can
+    /// never hide the Resume action for the others.
+    pub fn recompute_paused(&mut self) {
+        let active = self.active_bypass_ids();
+        self.bypass_paused = match self.store.active_profile {
+            Some(pid) => self
+                .store
+                .profiles
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| {
+                    p.enabled
+                        && p.rules
+                            .iter()
+                            .any(|r| r.enabled && !active.contains(&r.app_id))
+                })
+                .unwrap_or(false),
+            None => false,
+        };
     }
 
     pub fn new() -> Self {
@@ -96,7 +122,10 @@ impl AppState {
 
         // Merge custom apps from store
         for custom in &store.custom_apps {
-            if !apps.iter().any(|a| a.executable.eq_ignore_ascii_case(&custom.executable)) {
+            if !apps
+                .iter()
+                .any(|a| a.executable.eq_ignore_ascii_case(&custom.executable))
+            {
                 apps.push(custom.clone());
             }
         }
@@ -110,8 +139,20 @@ impl AppState {
             store.selected_adapter_id.as_deref(),
             store.selected_adapter_index,
         );
+        // Persist the GUID of the resolved interface so profiles created
+        // later (and the next startup) resolve by GUID, not by IfIndex:
+        // an auto-detected selection must not leave a profile with only an
+        // unstable index behind.
+        if let Some(idx) = selected_direct_if {
+            if let Some(iface) = interfaces.iter().find(|i| i.index == idx) {
+                store.selected_adapter_id = Some(iface.adapter_id.clone());
+                store.selected_adapter_index = Some(idx);
+            }
+        }
 
-        let (running_processes, process_parents, pid_to_path) = injector::get_process_maps();
+        // The basename-keyed process map is intentionally discarded: all
+        // status decisions use full executable paths (see is_app_running).
+        let (_running_processes, process_parents, pid_to_path) = injector::get_process_maps();
         let active_network_pids = network::get_active_network_pids();
 
         let mut state = Self {
@@ -132,7 +173,6 @@ impl AppState {
             filter_net_only: false,
             filter_bypassed_only: false,
             filter_blocked_only: false,
-            running_processes,
             process_parents,
             pid_to_path,
             active_network_pids,
@@ -175,7 +215,11 @@ impl AppState {
             });
             state.store.active_profile = Some(default_id);
         } else if state.store.active_profile.is_none()
-            || !state.store.profiles.iter().any(|p| Some(p.id) == state.store.active_profile)
+            || !state
+                .store
+                .profiles
+                .iter()
+                .any(|p| Some(p.id) == state.store.active_profile)
         {
             state.store.active_profile = Some(state.store.profiles[0].id);
         }
@@ -215,11 +259,22 @@ impl AppState {
         // the startup path, with a brief unblocked window in between.)
         if crate::windows::privilege::is_elevated() {
             for blocked_id in &state.store.blocked_apps {
-                if crate::windows::firewall::is_rule_present(blocked_id) {
-                    continue;
-                }
-                if let Some(app) = state.apps.iter().find(|a| a.id == *blocked_id) {
-                    let _ = crate::windows::firewall::block_app(blocked_id, &app.name, &app.executable);
+                match crate::windows::firewall::query_rule_directions(blocked_id) {
+                    Ok((true, true)) => continue,
+                    Ok(_) => {
+                        if let Some(app) = state.apps.iter().find(|a| a.id == *blocked_id) {
+                            let _ = crate::windows::firewall::block_app(
+                                blocked_id,
+                                &app.name,
+                                &app.executable,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Unknown is not absent: leave the existing rules
+                        // alone instead of recreating (or assuming) them.
+                        config::append_log(&format!("FIREWALL_VERIFY_FAILED {} {}", blocked_id, e));
+                    }
                 }
             }
         }
@@ -233,6 +288,13 @@ impl AppState {
     /// Background enforcement loop: process discovery, injection of newly
     /// started bypassed apps, and adapter-IP tracking — independent of the
     /// UI repaint cycle, so it keeps running while the window is in the tray.
+    ///
+    /// The cycle is split in three phases so the manager mutex is only held
+    /// for short snapshot/commit steps.
+    ///
+    /// Snapshot (lock), plan + DLL resolve + injections (no lock), commit
+    /// (lock). UI status reads therefore never queue behind a remote-thread
+    /// or hook-status wait.
     fn spawn_watchdog_thread(&self) {
         let manager = self.manager.clone();
         let adapter = self.watchdog_adapter.clone();
@@ -246,8 +308,40 @@ impl AppState {
                 let ip = idx
                     .and_then(|i| ifaces.iter().find(|x| x.index == i))
                     .and_then(|i| i.ipv4.clone());
+                let snapshot = {
+                    let mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
+                    mgr.watchdog_snapshot()
+                };
+                if snapshot.entries.is_empty() {
+                    continue;
+                }
+                let dll_path = match injector::ensure_dll_extracted() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
+                        continue;
+                    }
+                };
+                let plan = EnforcementManager::watchdog_plan(&snapshot, &maps);
+                let mut injected: HashMap<Uuid, Vec<(u32, u64)>> = HashMap::new();
+                let mut errors: HashMap<Uuid, String> = HashMap::new();
+                for entry in &plan {
+                    for &pid in &entry.to_inject {
+                        match injector::inject_dll_into_pid(pid, &dll_path) {
+                            Ok(()) => {
+                                injected
+                                    .entry(entry.app_id)
+                                    .or_default()
+                                    .push((pid, injector::process_creation_time(pid).unwrap_or(0)));
+                            }
+                            Err(e) => {
+                                errors.insert(entry.app_id, e);
+                            }
+                        }
+                    }
+                }
                 let mut mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.check_watchdog(&maps, ip.as_deref());
+                mgr.watchdog_commit(plan, &injected, &errors, ip.as_deref());
             });
     }
 
@@ -293,16 +387,21 @@ impl AppState {
             .map(|x| x.index)
     }
 
-    pub fn save(&mut self) {
+    /// Persists the store. Returns Err (and leaves the error in
+    /// `self.status`) when saving is disabled or fails, so callers can
+    /// never report an operation as successful when it was not persisted.
+    pub fn save(&mut self) -> Result<(), String> {
         if self.config_load_failed {
             self.status =
                 "Config file could not be loaded at startup; saving is disabled to protect it."
                     .into();
-            return;
+            return Err("config load failed at startup".into());
         }
         if let Err(e) = config::save(&self.store) {
             self.status = format!("Save error: {}", e);
+            return Err(e.to_string());
         }
+        Ok(())
     }
 
     pub fn auto_discover_network_apps(&mut self) {
@@ -329,13 +428,19 @@ impl AppState {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "App".into());
 
-            // Check if already in self.apps
-            let already_exists = self.apps.iter().any(|a| {
-                a.executable.eq_ignore_ascii_case(&exe_path)
-                    || a.name.eq_ignore_ascii_case(&file_stem)
-            });
+            // Check if already in self.apps, by executable path ONLY: a
+            // same-name binary in another folder is a different app and
+            // must not be swallowed by a display-name match.
+            let already_exists = self
+                .apps
+                .iter()
+                .any(|a| a.executable.eq_ignore_ascii_case(&exe_path));
 
-            if !already_exists && !new_entries.iter().any(|a: &AppEntry| a.executable.eq_ignore_ascii_case(&exe_path)) {
+            if !already_exists
+                && !new_entries
+                    .iter()
+                    .any(|a: &AppEntry| a.executable.eq_ignore_ascii_case(&exe_path))
+            {
                 let id = discovery::generate_app_id(&exe_path);
                 new_entries.push(AppEntry {
                     id,
@@ -355,8 +460,7 @@ impl AppState {
     }
 
     pub fn update_running_cache(&mut self) {
-        let (running_map, parents, paths) = injector::get_process_maps();
-        self.running_processes = running_map;
+        let (_running_map, parents, paths) = injector::get_process_maps();
         self.process_parents = parents;
         self.pid_to_path = paths;
         self.active_network_pids = network::get_active_network_pids();
@@ -389,64 +493,42 @@ impl AppState {
     }
 
     pub fn is_app_running(&self, app: &AppEntry) -> bool {
-        let exe_file = Path::new(&app.executable)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-
-        if !exe_file.is_empty() && self.running_processes.contains_key(&exe_file) {
-            return true;
-        }
-
-        let name_lower = app.name.to_ascii_lowercase();
-        if self.running_processes.contains_key(&name_lower) {
-            return true;
-        }
-
-        let with_exe = format!("{}.exe", name_lower);
-        if self.running_processes.contains_key(&with_exe) {
-            return true;
-        }
-
-        // Direct path match in active processes
-        self.pid_to_path.values().any(|p| p.eq_ignore_ascii_case(&app.executable))
+        // Full executable path ONLY: a same-name binary in another folder
+        // must never make this app look running. (The basename-keyed
+        // process map is deliberately not consulted here.)
+        self.pid_to_path
+            .values()
+            .any(|p| p.eq_ignore_ascii_case(&app.executable))
     }
 
     pub fn has_active_network(&self, app: &AppEntry) -> bool {
-        let exe_file = Path::new(&app.executable)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-
-        // 1. Direct PID match by exe file name
-        if let Some(pids) = self.running_processes.get(&exe_file) {
-            if pids.iter().any(|p| self.active_network_pids.contains(p)) {
-                return true;
-            }
+        // Exact-path PIDs of this app (no basename fallback: a same-name
+        // binary elsewhere must never make this app look online).
+        let own_pids: Vec<u32> = self
+            .pid_to_path
+            .iter()
+            .filter(|(_, p)| p.eq_ignore_ascii_case(&app.executable))
+            .map(|(pid, _)| *pid)
+            .collect();
+        if own_pids
+            .iter()
+            .any(|p| self.active_network_pids.contains(p))
+        {
+            return true;
         }
 
-        // 2. Direct PID match by app name
-        let name_lower = app.name.to_ascii_lowercase();
-        if let Some(pids) = self.running_processes.get(&name_lower) {
-            if pids.iter().any(|p| self.active_network_pids.contains(p)) {
-                return true;
-            }
-        }
-
-        // 3. Child process match (e.g. Steam -> steamwebhelper, Discord -> DiscordHelper, Electron apps)
-        if let Some(pids) = self.running_processes.get(&exe_file) {
-            for net_pid in &self.active_network_pids {
-                if let Some(parent) = self.process_parents.get(net_pid) {
-                    if pids.contains(parent) {
-                        return true;
-                    }
+        // Child process match (e.g. Steam -> steamwebhelper, Discord -> DiscordHelper, Electron apps)
+        for net_pid in &self.active_network_pids {
+            if let Some(parent) = self.process_parents.get(net_pid) {
+                if own_pids.contains(parent) {
+                    return true;
                 }
             }
         }
 
-        // 4. Same directory / Sub-directory binary match. The prefix must
-        //    end at a path separator boundary: "C:\Program Files\Foo" must
-        //    not match processes in "C:\Program Files\FooBar".
+        // Same directory / Sub-directory binary match. The prefix must
+        // end at a path separator boundary: "C:\Program Files\Foo" must
+        // not match processes in "C:\Program Files\FooBar".
         if let Some(app_dir) = Path::new(&app.executable).parent() {
             let app_dir_str = app_dir.to_string_lossy().to_ascii_lowercase();
             if app_dir_str.len() > 3 {
@@ -469,7 +551,9 @@ impl AppState {
             self.status = format!("Autostart setting error: {}", e);
         } else {
             self.store.autostart = enable;
-            self.save();
+            // The registry/task is the source of truth and is re-synced at
+            // startup, so a failed config save does not change the outcome.
+            let _ = self.save();
             self.status = if enable {
                 "BiFlow configured to start automatically with Windows.".into()
             } else {
@@ -490,7 +574,10 @@ impl AppState {
             }
         }
         for custom in &self.store.custom_apps {
-            if !discovered.iter().any(|a| a.executable.eq_ignore_ascii_case(&custom.executable)) {
+            if !discovered
+                .iter()
+                .any(|a| a.executable.eq_ignore_ascii_case(&custom.executable))
+            {
                 discovered.push(custom.clone());
             }
         }
@@ -502,7 +589,9 @@ impl AppState {
         self.selected_direct_if = Self::resolve_adapter(
             &self.interfaces,
             self.store.selected_adapter_id.as_deref(),
-            self.store.selected_adapter_index.or(self.selected_direct_if),
+            self.store
+                .selected_adapter_index
+                .or(self.selected_direct_if),
         );
         if let Ok(mut wa) = self.watchdog_adapter.lock() {
             *wa = self.selected_direct_if;
@@ -525,20 +614,30 @@ impl AppState {
 
     #[allow(dead_code)]
     pub fn selected_app_entry(&self) -> Option<&AppEntry> {
-        self.selected_app.and_then(|id| self.apps.iter().find(|a| a.id == id))
+        self.selected_app
+            .and_then(|id| self.apps.iter().find(|a| a.id == id))
     }
 
     pub fn direct_interface(&self) -> Option<&InterfaceInfo> {
-        self.selected_direct_if.and_then(|i| self.interfaces.iter().find(|x| x.index == i))
+        self.selected_direct_if
+            .and_then(|i| self.interfaces.iter().find(|x| x.index == i))
     }
 
     pub fn add_custom_file(&mut self) {
         if let Some(app) = discovery::pick_executable_file() {
             let id = app.id;
-            if !self.apps.iter().any(|a| a.executable.eq_ignore_ascii_case(&app.executable)) {
+            if !self
+                .apps
+                .iter()
+                .any(|a| a.executable.eq_ignore_ascii_case(&app.executable))
+            {
                 self.apps.push(app.clone());
                 self.store.custom_apps.push(app);
-                self.save();
+                if self.save().is_err() {
+                    // save() already left the error in self.status.
+                    self.selected_app = Some(id);
+                    return;
+                }
             }
             self.selected_app = Some(id);
             self.status = "Application added successfully.".into();
@@ -572,7 +671,11 @@ impl AppState {
                     self.store
                         .blocked_executables
                         .retain(|e| !e.eq_ignore_ascii_case(&app.executable));
-                    self.save();
+                    if self.save().is_err() {
+                        // save() left the error in self.status; the block
+                        // list change is live but will not survive restart.
+                        return;
+                    }
                     self.status = format!("✅ Internet access unblocked for {}.", app.name);
                 }
                 Err(e) => {
@@ -583,7 +686,7 @@ impl AppState {
             // If the app is currently bypassed, disable the bypass first
             if self.manager().is_active(app_id) {
                 let _ = self.manager().remove(app_id);
-                self.update_active_profile_rule(app_id, false);
+                let _ = self.update_active_profile_rule(app_id, false);
             }
 
             match crate::windows::firewall::block_app(&app_id, &app.name, &app.executable) {
@@ -599,7 +702,9 @@ impl AppState {
                     {
                         self.store.blocked_executables.push(app.executable.clone());
                     }
-                    self.save();
+                    if self.save().is_err() {
+                        return;
+                    }
                     self.status = format!(
                         "🚫 Internet access completely blocked for {}! Windows Firewall is now blocking all connections.",
                         app.name
@@ -615,10 +720,16 @@ impl AppState {
     pub fn unblock_all_apps(&mut self) {
         match crate::windows::firewall::clear_all_blocked_rules(&self.store.blocked_apps) {
             Ok(()) => {
-                let count = self.store.blocked_apps.len().max(self.store.blocked_executables.len());
+                let count = self
+                    .store
+                    .blocked_apps
+                    .len()
+                    .max(self.store.blocked_executables.len());
                 self.store.blocked_apps.clear();
                 self.store.blocked_executables.clear();
-                self.save();
+                if self.save().is_err() {
+                    return;
+                }
                 self.status = format!(
                     "✅ All {} blocked applications have been unblocked from Windows Firewall.",
                     count
@@ -637,7 +748,22 @@ impl AppState {
         }
         if let Some(pid) = self.store.active_profile {
             if let Some(p) = self.store.profiles.iter().find(|p| p.id == pid) {
-                return p.rules.iter().any(|r| r.app_id == app_id && r.enabled);
+                // A disabled profile's rules are dormant, not bypasses.
+                return p.enabled && p.rules.iter().any(|r| r.app_id == app_id && r.enabled);
+            }
+        }
+        false
+    }
+
+    /// Same as is_app_bypassed, but against a pre-fetched manager snapshot
+    /// (one lock per frame instead of one per row).
+    pub fn is_app_bypassed_cached(&self, app_id: Uuid, active: &HashSet<Uuid>) -> bool {
+        if active.contains(&app_id) {
+            return true;
+        }
+        if let Some(pid) = self.store.active_profile {
+            if let Some(p) = self.store.profiles.iter().find(|p| p.id == pid) {
+                return p.enabled && p.rules.iter().any(|r| r.app_id == app_id && r.enabled);
             }
         }
         false
@@ -661,17 +787,32 @@ impl AppState {
                 p.adapter_id = adapter_id;
             }
         }
-        self.save();
-        self.bypass_paused = false;
+        // Adapter choice is explicit, but it does not activate a dormant
+        // profile: apply_active_profile_rules still skips disabled profiles.
+        // A failed save does not block the live switch; it is reported in
+        // the status instead of being masked by a success message.
+        let saved = self.save();
         let _ = self.manager().clear_all();
-        self.apply_active_profile_rules();
+        let _ = self.apply_active_profile_rules();
+        self.recompute_paused();
         if let Some(iface) = self.interfaces.iter().find(|i| i.index == idx) {
-            self.status = format!("Direct network adapter set to '{}' for active profile.", iface.name);
+            self.status = match saved {
+                Ok(()) => format!(
+                    "Direct network adapter set to '{}' for active profile.",
+                    iface.name
+                ),
+                Err(e) => format!(
+                    "Direct network adapter set to '{}', but the choice could not be saved: {}",
+                    iface.name, e
+                ),
+            };
         }
     }
 
     pub fn has_unsaved_changes(&self) -> bool {
-        let Some(pid) = self.store.active_profile else { return false; };
+        let Some(pid) = self.store.active_profile else {
+            return false;
+        };
         if let Some(p) = self.store.profiles.iter().find(|p| p.id == pid) {
             return p.rules != self.active_profile_baseline;
         }
@@ -679,15 +820,23 @@ impl AppState {
     }
 
     pub fn revert_active_profile(&mut self) {
-        let Some(pid) = self.store.active_profile else { return; };
+        let Some(pid) = self.store.active_profile else {
+            return;
+        };
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == pid) {
             p.rules = self.active_profile_baseline.clone();
         }
-        self.save();
-        self.bypass_paused = false;
+        let saved = self.save();
         let _ = self.manager().clear_all();
-        self.apply_active_profile_rules();
-        self.status = "Reverted profile changes to last saved state.".into();
+        let _ = self.apply_active_profile_rules();
+        self.recompute_paused();
+        self.status = match saved {
+            Ok(()) => "Reverted profile changes to last saved state.".into(),
+            Err(e) => format!(
+                "Profile changes reverted in memory, but the revert could not be saved: {}",
+                e
+            ),
+        };
     }
 
     pub fn toggle_bypass(&mut self) {
@@ -701,31 +850,57 @@ impl AppState {
         };
 
         if self.is_app_blocked(app_id) {
-            self.status = format!("Cannot enable bypass: {} is currently blocked from internet.", app.name);
+            self.status = format!(
+                "Cannot enable bypass: {} is currently blocked from internet.",
+                app.name
+            );
             return;
         }
 
         let currently_bypassed = self.is_app_bypassed(app_id);
 
         if currently_bypassed {
-            let _ = self.manager().remove(app_id);
-            self.update_active_profile_rule(app_id, false);
+            let remove_result = self.manager().remove(app_id);
+            if let Err(e) = remove_result {
+                self.status = format!("Bypass removal failed (bypass remains active): {}", e);
+                return;
+            }
+            if let Err(e) = self.update_active_profile_rule(app_id, false) {
+                self.status = format!(
+                    "Bypass disabled live, but the profile change could not be saved: {}",
+                    e
+                );
+                return;
+            }
+            self.recompute_paused();
             self.status = format!("Bypass disabled for {}", app.name);
             return;
         }
 
-        self.bypass_paused = false;
-        self.update_active_profile_rule(app_id, true);
+        // An explicit toggle also wakes a dormant active profile.
+        if let Some(pid) = self.store.active_profile {
+            if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == pid) {
+                p.enabled = true;
+            }
+        }
+        let saved = self.update_active_profile_rule(app_id, true);
 
         if let Some(direct) = self.direct_interface().cloned() {
             let exe_path = PathBuf::from(&app.executable);
             let apply_result = self.manager().apply(app_id, exe_path, &direct);
             match apply_result {
                 Ok(_) => {
-                    self.status = format!(
-                        "Direct bypass activated for {}! New connections will route via {}.",
-                        app.name, direct.name
-                    );
+                    self.recompute_paused();
+                    self.status = match saved {
+                        Ok(()) => format!(
+                            "Direct bypass activated for {}! New connections will route via {}.",
+                            app.name, direct.name
+                        ),
+                        Err(e) => format!(
+                            "Direct bypass activated for {} via {}, but the profile could not be saved (restart will lose it): {}",
+                            app.name, direct.name, e
+                        ),
+                    };
                 }
                 Err(e) => {
                     self.status = format!("Saved in profile (live route warning: {})", e);
@@ -750,7 +925,10 @@ impl AppState {
         };
 
         if self.is_app_blocked(app_id) {
-            self.status = format!("Cannot launch bypass: {} is currently blocked from internet.", app.name);
+            self.status = format!(
+                "Cannot launch bypass: {} is currently blocked from internet.",
+                app.name
+            );
             return;
         }
 
@@ -767,8 +945,8 @@ impl AppState {
         let launch_result = self.manager().launch(app_id, &exe_path, &direct);
         match launch_result {
             Ok((pid, unelevated)) => {
-                self.bypass_paused = false;
-                self.update_active_profile_rule(app_id, true);
+                self.recompute_paused();
+                let _ = self.update_active_profile_rule(app_id, true);
                 // Honest disclosure: hooking Chromium requires disabling its
                 // renderer code integrity and ignoring the system proxy.
                 let file_name = Path::new(&app.executable)
@@ -794,7 +972,7 @@ impl AppState {
                     ""
                 };
                 self.status = format!(
-                    "Launched {} (PID: {}) directly bypassing VPN via {}!{}{}{}",
+                    "Launched {} (PID: {}) with the bypass hook installed via {}. Egress route is not verified — compare public IP to confirm.{}{}{}",
                     app.name, pid, direct.name, chromium_note, elevation_note, running_note
                 );
             }
@@ -805,19 +983,23 @@ impl AppState {
     }
 
     pub fn disable_all(&mut self) {
-        let _ = self.manager().clear_all();
-        injector::clear_target_ip();
-        // Profile rules survive Disable All; remember that state so the UI
-        // can offer a one-click Resume instead of a dead end.
-        self.bypass_paused = self
-            .store
-            .active_profile
-            .and_then(|pid| self.store.profiles.iter().find(|p| p.id == pid))
-            .map(|p| p.rules.iter().any(|r| r.enabled))
-            .unwrap_or(false);
-        self.status =
-            "All active bypasses paused. Profile rules preserved — use Resume Bypasses to re-apply them."
-                .into();
+        // A failed manager clear restores the entries (fail-closed), so it
+        // must be reported as "still active", not as "paused".
+        let clear_result = self.manager().clear_all();
+        if let Err(e) = clear_result {
+            self.recompute_paused();
+            self.status = format!("Could not pause bypasses (they remain active): {}", e);
+            return;
+        }
+        let file_err = injector::clear_target_ip().err();
+        self.recompute_paused();
+        self.status = match file_err {
+            Some(e) => format!(
+                "Bypasses paused in memory, but policy file cleanup failed ({}); already-injected processes may keep bypassing until cleanup succeeds",
+                e
+            ),
+            None => "All active bypasses paused. Profile rules preserved — use Resume Bypasses to re-apply them.".into(),
+        };
     }
 
     pub fn bypasses_paused(&self) -> bool {
@@ -825,18 +1007,35 @@ impl AppState {
     }
 
     pub fn resume_all(&mut self) {
-        self.bypass_paused = false;
-        self.apply_active_profile_rules();
-        self.status = "Bypasses resumed from the active profile rules.".into();
+        // An explicit resume also wakes a dormant active profile; the
+        // recompute below keeps Resume visible if any rule still failed.
+        if let Some(pid) = self.store.active_profile {
+            if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == pid) {
+                p.enabled = true;
+            }
+        }
+        let (applied, failed) = self.apply_active_profile_rules();
+        self.recompute_paused();
+        self.status = if failed > 0 {
+            format!(
+                "Bypasses resumed from the active profile rules ({} applied, {} failed).",
+                applied, failed
+            )
+        } else {
+            "Bypasses resumed from the active profile rules.".into()
+        };
     }
 
     pub fn switch_profile(&mut self, profile_id: Uuid) {
         // 1. Clear active live bypass enforcement in memory without altering stored profile rules
         let _ = self.manager().clear_all();
-        self.bypass_paused = false;
 
-        // 2. Set active profile
+        // 2. Set active profile. Switching to a profile is an explicit
+        // activation, so a dormant profile wakes up here.
         self.store.active_profile = Some(profile_id);
+        if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) {
+            p.enabled = true;
+        }
 
         // 3. Apply adapter preference from this profile if saved and valid
         if let Some(p) = self.store.profiles.iter().find(|p| p.id == profile_id) {
@@ -854,17 +1053,37 @@ impl AppState {
                     }
                 }
             }
-            self.active_profile_baseline = p.rules.clone();
         }
 
-        self.save();
+        // The baseline tracks the last PERSISTED rules: only move it when
+        // the save succeeds, or "Modified" would describe a change that was
+        // never actually saved.
+        let baseline = self
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| p.rules.clone());
+        let saved = self.save();
+        if saved.is_ok() {
+            if let Some(rules) = baseline {
+                self.active_profile_baseline = rules;
+            }
+        }
 
         // 4. Apply all enabled rules from the new active profile
-        self.apply_active_profile_rules();
+        let _ = self.apply_active_profile_rules();
+        self.recompute_paused();
 
         if let Some(p) = self.store.profiles.iter().find(|x| x.id == profile_id) {
             let active_count = p.rules.iter().filter(|r| r.enabled).count();
-            self.status = format!("Activated profile '{}' ({} rules active).", p.name, active_count);
+            self.status = match saved {
+                Ok(()) => format!("Activated profile '{}' ({} rules active).", p.name, active_count),
+                Err(e) => format!(
+                    "Activated profile '{}' ({} rules active), but the switch could not be saved: {}",
+                    p.name, active_count, e
+                ),
+            };
         }
     }
 
@@ -902,6 +1121,18 @@ impl AppState {
             vec![]
         };
 
+        // Resolve the adapter GUID from the selected interface: a profile
+        // created from an auto-detected selection must not carry only an
+        // unstable IfIndex.
+        let adapter_id = self
+            .selected_direct_if
+            .and_then(|idx| {
+                self.interfaces
+                    .iter()
+                    .find(|i| i.index == idx)
+                    .map(|i| i.adapter_id.clone())
+            })
+            .or_else(|| self.store.selected_adapter_id.clone());
         let new_profile = Profile {
             id: new_id,
             name: name.clone(),
@@ -909,18 +1140,27 @@ impl AppState {
             priority: 100,
             rules: rules.clone(),
             adapter_index: self.selected_direct_if,
-            adapter_id: self.store.selected_adapter_id.clone(),
+            adapter_id,
         };
 
         self.store.profiles.push(new_profile);
         self.store.active_profile = Some(new_id);
-        self.active_profile_baseline = rules;
-        self.save();
+        let saved = self.save();
+        if saved.is_ok() {
+            self.active_profile_baseline = rules;
+        }
 
         let _ = self.manager().clear_all();
-        self.apply_active_profile_rules();
+        let _ = self.apply_active_profile_rules();
+        self.recompute_paused();
 
-        self.status = format!("Created and activated profile '{}'.", name);
+        self.status = match saved {
+            Ok(()) => format!("Created and activated profile '{}'.", name),
+            Err(e) => format!(
+                "Created and activated profile '{}', but it could not be saved: {}",
+                name, e
+            ),
+        };
         new_id
     }
 
@@ -931,18 +1171,21 @@ impl AppState {
 
         let is_active = self.store.active_profile == Some(profile_id);
 
-        let removed_name = if let Some(pos) = self.store.profiles.iter().position(|p| p.id == profile_id) {
-            let p = self.store.profiles.remove(pos);
-            p.name
-        } else {
-            return Err("Profile not found.".into());
-        };
+        let removed_name =
+            if let Some(pos) = self.store.profiles.iter().position(|p| p.id == profile_id) {
+                let p = self.store.profiles.remove(pos);
+                p.name
+            } else {
+                return Err("Profile not found.".into());
+            };
 
         if is_active {
             let next_id = self.store.profiles[0].id;
             self.switch_profile(next_id);
-        } else {
-            self.save();
+        } else if self.save().is_err() {
+            // save() left the error in self.status; the deletion is live
+            // but will not survive restart.
+            return Ok(());
         }
 
         self.status = format!("Deleted profile '{}'.", removed_name);
@@ -950,7 +1193,12 @@ impl AppState {
     }
 
     pub fn duplicate_profile(&mut self, profile_id: Uuid) -> Option<Uuid> {
-        let profile = self.store.profiles.iter().find(|p| p.id == profile_id)?.clone();
+        let profile = self
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)?
+            .clone();
         let new_id = Uuid::new_v4();
         let new_name = format!("{} (Copy)", profile.name);
         let new_profile = Profile {
@@ -963,8 +1211,13 @@ impl AppState {
             adapter_id: profile.adapter_id.clone(),
         };
         self.store.profiles.push(new_profile);
-        self.save();
-        self.status = format!("Duplicated profile to '{}'.", new_name);
+        self.status = match self.save() {
+            Ok(()) => format!("Duplicated profile to '{}'.", new_name),
+            Err(e) => format!(
+                "Duplicated profile to '{}', but it could not be saved: {}",
+                new_name, e
+            ),
+        };
         Some(new_id)
     }
 
@@ -975,35 +1228,66 @@ impl AppState {
         }
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) {
             p.name = trimmed.to_string();
-            self.save();
+            if self.save().is_err() {
+                return;
+            }
             self.status = format!("Renamed profile to '{}'.", trimmed);
         }
     }
 
     pub fn save_current_bypasses_to_active_profile(&mut self) {
-        let Some(active_pid) = self.store.active_profile else { return; };
+        let Some(active_pid) = self.store.active_profile else {
+            return;
+        };
 
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == active_pid) {
             p.adapter_index = self.selected_direct_if;
-            self.active_profile_baseline = p.rules.clone();
+            // Resolve the GUID from the selected interface as well, so a
+            // saved profile never carries only an unstable IfIndex.
+            p.adapter_id = self
+                .selected_direct_if
+                .and_then(|idx| {
+                    self.interfaces
+                        .iter()
+                        .find(|i| i.index == idx)
+                        .map(|i| i.adapter_id.clone())
+                })
+                .or_else(|| p.adapter_id.clone());
             let count = p.rules.iter().filter(|r| r.enabled).count();
             let name = p.name.clone();
-            self.save();
-            self.status = format!("Saved {} bypass rules into active profile '{}'.", count, name);
+            let rules = p.rules.clone();
+            // Baseline tracks the last PERSISTED rules: only move it when
+            // the save succeeds.
+            if self.save().is_ok() {
+                self.active_profile_baseline = rules;
+                self.status = format!(
+                    "Saved {} bypass rules into active profile '{}'.",
+                    count, name
+                );
+            }
         }
     }
 
     pub fn remove_rule_from_profile(&mut self, profile_id: Uuid, app_id: Uuid) {
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) {
             p.rules.retain(|r| r.app_id != app_id);
-            self.save();
+            let rules = p.rules.clone();
+            // Keep the baseline honest for the active profile: a saved
+            // removal must not leave "Modified" behind.
+            if self.save().is_ok() && self.store.active_profile == Some(profile_id) {
+                self.active_profile_baseline = rules;
+            }
         }
         if self.store.active_profile == Some(profile_id) {
             let _ = self.manager().remove(app_id);
         }
     }
 
-    fn update_active_profile_rule(&mut self, app_id: Uuid, enabled: bool) {
+    /// Updates the active profile's rule for one app and persists it
+    /// immediately. The baseline moves only when the save succeeds, so a
+    /// toggle can never be both "already saved" and "Modified", and
+    /// Revert can never undo a change that is already on disk.
+    fn update_active_profile_rule(&mut self, app_id: Uuid, enabled: bool) -> Result<(), String> {
         let exe_path = self
             .apps
             .iter()
@@ -1014,8 +1298,7 @@ impl AppState {
             if let Some(p) = self.store.profiles.iter_mut().find(|x| x.id == pid) {
                 if enabled {
                     if let Some(r) = p.rules.iter_mut().find(|r| {
-                        r.app_id == app_id
-                            || (r.exe_path.is_some() && r.exe_path == exe_path)
+                        r.app_id == app_id || (r.exe_path.is_some() && r.exe_path == exe_path)
                     }) {
                         r.app_id = app_id;
                         r.enabled = true;
@@ -1032,43 +1315,78 @@ impl AppState {
                 } else {
                     p.rules.retain(|r| {
                         !(r.app_id == app_id
-                            || (r.exe_path.is_some() && exe_path.is_some() && r.exe_path == exe_path))
+                            || (r.exe_path.is_some()
+                                && exe_path.is_some()
+                                && r.exe_path == exe_path))
                     });
                 }
             }
-            self.save();
+            let rules = self
+                .store
+                .profiles
+                .iter()
+                .find(|x| x.id == pid)
+                .map(|p| p.rules.clone());
+            self.save()?;
+            if let Some(rules) = rules {
+                self.active_profile_baseline = rules;
+            }
         }
+        Ok(())
     }
 
-    pub fn apply_active_profile_rules(&mut self) {
-        let Some(pid) = self.store.active_profile else { return; };
-        let rules = match self.store.profiles.iter().find(|p| p.id == pid) {
-            Some(p) => p.rules.clone(),
-            None => return,
+    /// Applies the active profile's enabled rules to the enforcement
+    /// manager. Returns (applied, failed). A disabled profile applies
+    /// nothing: its rules are dormant until an explicit action wakes it.
+    /// A rule whose app was never discovered is still registered (by its
+    /// stored exe_path), so the watchdog injects the process when it later
+    /// appears instead of silently dropping the rule at startup.
+    pub fn apply_active_profile_rules(&mut self) -> (usize, usize) {
+        let Some(pid) = self.store.active_profile else {
+            return (0, 0);
+        };
+        let (enabled, rules) = match self.store.profiles.iter().find(|p| p.id == pid) {
+            Some(p) => (p.enabled, p.rules.clone()),
+            None => return (0, 0),
+        };
+        if !enabled {
+            return (0, 0);
+        }
+
+        let Some(direct) = self.direct_interface().cloned() else {
+            return (0, 0);
         };
 
-        let Some(direct) = self.direct_interface().cloned() else { return; };
-
+        let mut applied = 0;
+        let mut failed = 0;
         for rule in rules {
             if rule.enabled {
-                let app = self
-                    .apps
-                    .iter()
-                    .find(|a| a.id == rule.app_id)
-                    .or_else(|| {
-                        if let Some(exe) = &rule.exe_path {
-                            self.apps.iter().find(|a| a.executable.eq_ignore_ascii_case(exe))
-                        } else {
-                            None
-                        }
-                    });
+                let app = self.apps.iter().find(|a| a.id == rule.app_id).or_else(|| {
+                    if let Some(exe) = &rule.exe_path {
+                        self.apps
+                            .iter()
+                            .find(|a| a.executable.eq_ignore_ascii_case(exe))
+                    } else {
+                        None
+                    }
+                });
 
-                if let Some(app) = app {
-                    let exe = PathBuf::from(&app.executable);
-                    let _ = self.manager().apply(app.id, exe, &direct);
+                let target: Option<(Uuid, PathBuf)> = if let Some(app) = app {
+                    Some((app.id, PathBuf::from(&app.executable)))
+                } else if let Some(exe) = &rule.exe_path {
+                    Some((rule.app_id, PathBuf::from(exe)))
+                } else {
+                    None
+                };
+                if let Some((id, exe)) = target {
+                    match self.manager().apply(id, exe, &direct) {
+                        Ok(()) => applied += 1,
+                        Err(_) => failed += 1,
+                    }
                 }
             }
         }
+        (applied, failed)
     }
 
     /// UI-cadence refresh tick (process cache + adapter list). Enforcement
