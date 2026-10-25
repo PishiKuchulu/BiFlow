@@ -41,7 +41,9 @@ fn main() -> eframe::Result<()> {
     // up: stale policy files would keep already-injected processes bypassing
     // with a dead adapter address. AppState re-applies the saved profile
     // rules right after this, so clearing first is safe.
-    windows::injector::clear_target_ip();
+    if let Err(e) = windows::injector::clear_target_ip() {
+        config::append_log(&format!("STARTUP_POLICY_CLEANUP_FAILED {}", e));
+    }
     windows::injector::clear_stale_hook_status();
 
     let start_minimized = std::env::args().any(|a| a == "--minimized");
@@ -145,8 +147,7 @@ fn setup_custom_style(ctx: &egui::Context) {
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
 
     visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-    visuals.selection.stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(147, 197, 253));
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(147, 197, 253));
 
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
@@ -176,7 +177,11 @@ enum Tab {
 }
 
 impl BiFlowApp {
-    fn new(_cc: &eframe::CreationContext<'_>, tray: Option<BiFlowTray>, start_minimized: bool) -> Self {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        tray: Option<BiFlowTray>,
+        start_minimized: bool,
+    ) -> Self {
         Self {
             state: AppState::new(),
             tab: Tab::Apps,
@@ -215,7 +220,7 @@ impl BiFlowApp {
         // thread, so no config save can be interrupted mid-write)
         if windows::tray::take_exit_requested() {
             self.state.disable_all();
-            windows::injector::clear_target_ip();
+            let _ = windows::injector::clear_target_ip();
             std::process::exit(0);
         }
 
@@ -228,7 +233,7 @@ impl BiFlowApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
                 self.state.disable_all();
-                windows::injector::clear_target_ip();
+                let _ = windows::injector::clear_target_ip();
                 std::process::exit(0);
             }
         }
@@ -330,10 +335,8 @@ impl BiFlowApp {
                         let is_curr = Some(p.id) == active_pid_opt;
                         let count = p.rules.iter().filter(|r| r.enabled).count();
                         let text = format!("{} ({} rules)", p.name, count);
-                        if ui.selectable_label(is_curr, text).clicked() {
-                            if !is_curr {
-                                switch_from_top_bar = Some(p.id);
-                            }
+                        if !is_curr && ui.selectable_label(is_curr, text).clicked() {
+                            switch_from_top_bar = Some(p.id);
                         }
                     }
                 });
@@ -369,7 +372,7 @@ impl BiFlowApp {
                     .clicked()
                 {
                     self.state.disable_all();
-                    windows::injector::clear_target_ip();
+                    let _ = windows::injector::clear_target_ip();
                     std::process::exit(0);
                 }
 
@@ -390,14 +393,13 @@ impl BiFlowApp {
                     self.state.disable_all();
                 }
 
-                if self.state.bypasses_paused() {
-                    if ui
+                if self.state.bypasses_paused()
+                    && ui
                         .button("▶ Resume Bypasses")
                         .on_hover_text("Re-apply the active profile's bypass rules")
                         .clicked()
-                    {
-                        self.state.resume_all();
-                    }
+                {
+                    self.state.resume_all();
                 }
 
                 if ui
@@ -446,11 +448,7 @@ impl BiFlowApp {
                 self.save_notification = None;
             }
 
-            let set_btn = ui.selectable_value(
-                &mut self.tab,
-                Tab::Settings,
-                "⚙ Settings & Startup",
-            );
+            let set_btn = ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings & Startup");
             if set_btn.clicked() {
                 self.save_notification = None;
             }
@@ -477,7 +475,12 @@ impl BiFlowApp {
             .iter()
             .filter(|a| self.state.app_network_cached(a))
             .count();
-        let active_bypasses_count = self.state.apps.iter().filter(|a| self.state.is_app_bypassed(a.id)).count();
+        let active_bypasses_count = self
+            .state
+            .apps
+            .iter()
+            .filter(|a| self.state.is_app_bypassed(a.id))
+            .count();
 
         ui.horizontal(|ui| {
             // Stat Card 1: Total
@@ -495,7 +498,11 @@ impl BiFlowApp {
             // Stat Card 2: Online with Internet
             ui.group(|ui| {
                 ui.set_min_width(160.0);
-                ui.label(egui::RichText::new("🌐 Active Internet Sockets").size(11.0).weak());
+                ui.label(
+                    egui::RichText::new("🌐 Active Internet Sockets")
+                        .size(11.0)
+                        .weak(),
+                );
                 ui.label(
                     egui::RichText::new(format!("{} Online", online_apps_count))
                         .strong()
@@ -561,10 +568,8 @@ impl BiFlowApp {
                     .desired_width(260.0),
             );
 
-            if !self.state.search.is_empty() {
-                if ui.button("✖").clicked() {
-                    self.state.search.clear();
-                }
+            if !self.state.search.is_empty() && ui.button("✖").clicked() {
+                self.state.search.clear();
             }
 
             ui.separator();
@@ -659,6 +664,11 @@ impl BiFlowApp {
                 let mut launch_target: Option<Uuid> = None;
                 let mut block_toggle_target: Option<Uuid> = None;
 
+                // One manager snapshot for the whole frame (one lock
+                // instead of three locks per rendered row).
+                let live_map = self.state.live_status_map();
+                let bypassed_ids = self.state.active_bypass_ids();
+
                 for app in &self.state.apps {
                     // Search query filter
                     if !q.is_empty()
@@ -672,9 +682,11 @@ impl BiFlowApp {
                     // cache (no repeated scans on the render path)
                     let is_running = self.state.app_running_cached(app);
                     let has_net = self.state.app_network_cached(app);
-                    let is_bypassed = self.state.is_app_bypassed(app.id);
-                    let live_status = self.state.live_status(app.id);
-                    let inject_error = self.state.inject_error(app.id);
+                    let is_bypassed = self.state.is_app_bypassed_cached(app.id, &bypassed_ids);
+                    let (live_status, inject_error) = match live_map.get(&app.id) {
+                        Some((s, e)) => (Some(*s), e.clone()),
+                        None => (None, None),
+                    };
                     let is_blocked = self.state.is_app_blocked(app.id);
 
                     if self.state.filter_running_only && !is_running {
@@ -778,7 +790,7 @@ impl BiFlowApp {
                                         Some(BypassLiveStatus::Live) => (
                                             "⚡ BYPASSING VPN",
                                             egui::Color32::from_rgb(52, 211, 153),
-                                            "Hook is active: new connections bypass the VPN via the direct adapter.",
+                                            "Hook installed in the process (5/5 hooks reported). New connections are bound to the direct adapter; egress route is not verified — compare public IP to confirm.",
                                         ),
                                         Some(BypassLiveStatus::Pending) => (
                                             "⚡ BYPASS CONFIGURED",
@@ -996,7 +1008,9 @@ impl BiFlowApp {
                             .monospace(),
                         );
                         ui.separator();
-                        ui.label(egui::RichText::new(format!("Interface Index: {}", iface.index)).weak());
+                        ui.label(
+                            egui::RichText::new(format!("Interface Index: {}", iface.index)).weak(),
+                        );
                     });
 
                     if !iface.description.is_empty() {
@@ -1065,8 +1079,12 @@ impl BiFlowApp {
 
             ui.add_space(6.0);
             if ui.button("💾 Save Preferences").clicked() {
-                self.state.save();
-                self.save_notification = Some("✔ Settings saved successfully.".into());
+                if self.state.save().is_err() {
+                    // save() left the error in state.status; surface it.
+                    self.save_notification = Some(format!("✖ {}", self.state.status.clone()));
+                } else {
+                    self.save_notification = Some("✔ Settings saved successfully.".into());
+                }
             }
         });
 
@@ -1107,11 +1125,11 @@ impl BiFlowApp {
                     self.save_notification = Some(format!("✔ Saved changes to profile '{}'.", active_profile_name));
                 }
 
-                if self.state.has_unsaved_changes() {
-                    if ui.button("↩ Revert").on_hover_text("Discard changes and revert to last saved state").clicked() {
-                        self.state.revert_active_profile();
-                        self.save_notification = Some(format!("✔ Reverted profile '{}'.", active_profile_name));
-                    }
+                if self.state.has_unsaved_changes()
+                    && ui.button("↩ Revert").on_hover_text("Discard changes and revert to last saved state").clicked()
+                {
+                    self.state.revert_active_profile();
+                    self.save_notification = Some(format!("✔ Reverted profile '{}'.", active_profile_name));
                 }
             });
 
@@ -1192,10 +1210,10 @@ impl BiFlowApp {
 
                         // Right aligned actions
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if profiles.len() > 1 {
-                                if ui.button("🗑 Delete").on_hover_text("Delete this profile").clicked() {
-                                    delete_target = Some(p.id);
-                                }
+                            if profiles.len() > 1
+                                && ui.button("🗑 Delete").on_hover_text("Delete this profile").clicked()
+                            {
+                                delete_target = Some(p.id);
                             }
 
                             if ui.button("📋 Duplicate").on_hover_text("Clone this profile").clicked() {
@@ -1292,12 +1310,10 @@ impl BiFlowApp {
             let blocked_count = self.state.store.blocked_apps.len();
             ui.horizontal(|ui| {
                 ui.label(format!("Currently Blocked: {} applications", blocked_count));
-                if blocked_count > 0 {
-                    if ui.button("🧹 Unblock All Applications").clicked() {
-                        self.state.unblock_all_apps();
-                        self.save_notification =
-                            Some("✔ All applications have been unblocked from Windows Firewall.".into());
-                    }
+                if blocked_count > 0 && ui.button("🧹 Unblock All Applications").clicked() {
+                    self.state.unblock_all_apps();
+                    self.save_notification =
+                        Some("✔ All applications have been unblocked from Windows Firewall.".into());
                 }
             });
 
@@ -1342,12 +1358,15 @@ impl BiFlowApp {
                     .size(14.0)
                     .color(egui::Color32::from_rgb(56, 189, 248)),
             );
-            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.3.0");
+            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.3.1");
             ui.label(format!(
                 "Configuration path: {}",
                 config::store_path().display()
             ));
-            ui.label(format!("Diagnostic log path: {}", config::log_path().display()));
+            ui.label(format!(
+                "Diagnostic log path: {}",
+                config::log_path().display()
+            ));
         });
     }
 
