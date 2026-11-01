@@ -44,14 +44,28 @@ no network connections of its own.
 - The hook DLL is embedded in `BiFlow.exe` and extracted to
   `%ProgramData%\BiFlow\bin\biflow_hook64_v<version>.dll`. Before every use
   its full content is compared byte-for-byte against the embedded copy.
-  The `%ProgramData%\BiFlow` directory is created with a protected DACL:
-  SYSTEM and Administrators have full control; standard users can only read
-  and execute. A non-elevated process therefore cannot swap the DLL that the
-  elevated BiFlow injects into other processes.
+  The `%ProgramData%\BiFlow` directory and its security-critical children
+  get a protected DACL **and** their owner is set to Administrators (both
+  verified after setting): SYSTEM and Administrators have full control;
+  standard users can only read and execute. Setting the owner matters —
+  an object's owner implicitly holds WRITE_DAC, so a DACL alone would
+  still let whoever created the folder rewrite its ACL. A non-elevated
+  process therefore cannot swap the DLL that the elevated BiFlow injects
+  into other processes. (The content check and the subsequent
+  `LoadLibraryW` remain separate path-based operations; the owner + DACL
+  protection is what makes that window unusable to a non-elevated
+  process.)
 - The policy files the hook reads (`target_ip.txt`, `bypass_apps.txt`) live
-  in the same protected directory and are authoritative there. Legacy copies
-  under `%TEMP%` are written for downgrade compatibility only and are read
-  by the hook solely when the ProgramData copy is absent.
+  in the same protected directory and are authoritative there. There is no
+  `%TEMP%` policy copy: legacy TEMP copies left by old versions are
+  deleted during cleanup, never written and never read.
+- Hook status reports (`hook_status_<pid>.txt`) live in a `status`
+  subfolder whose DACL additionally grants standard users write access:
+  the hook runs inside target processes with the user's normal token and
+  must be able to report, which the policy folder's read-only ACL made
+  impossible. A status report is advisory only — a same-user process
+  could in principle plant one — so BiFlow deletes any stale report for a
+  PID before injecting and never treats a report as policy.
 - BiFlow only ever injects into processes of apps **you** chose. Anyone with
   Administrator rights on the machine can already do all of this without BiFlow.
 - Chromium-based browsers launched via "Launch Direct" run with
