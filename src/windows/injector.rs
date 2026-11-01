@@ -47,24 +47,46 @@ pub fn biflow_programdata_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// SDDL for the policy/DLL objects: owner Administrators, protected DACL,
+/// full control for SYSTEM + Administrators, read/execute for Users.
+const POLICY_ACL_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+
+/// SDDL for the hook-status directory: like the policy ACL, but Users get
+/// GENERIC_WRITE so a target process running with the user's normal token
+/// can create its `hook_status_<pid>.txt` report. Under the policy ACL the
+/// hook could never write that report and every injection timed out.
+const STATUS_ACL_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GW;;;BU)";
+
 /// Applies the protected admin-only DACL to one path and verifies the
 /// result: unlike the old best-effort directory call, a failure here is
 /// reported so injection/policy publication never proceeds on assumed
 /// protection. Uses SetNamedSecurityInfoW (the documented replacement for
 /// the superseded SetFileSecurityW).
 pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
+    apply_acl_sddl(path, POLICY_ACL_SDDL)
+}
+
+/// Applies the status-directory ACL (owner Administrators + protected
+/// DACL + user write access for hook reports). See STATUS_ACL_SDDL.
+pub fn apply_status_acl(path: &Path) -> Result<(), String> {
+    apply_acl_sddl(path, STATUS_ACL_SDDL)
+}
+
+fn apply_acl_sddl(path: &Path, sddl_str: &str) -> Result<(), String> {
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
+    // O:BA = owner Administrators. Setting the owner matters as much as the
+    // DACL: an object's owner implicitly holds WRITE_DAC, so a DACL-only
+    // fix would still let the creating user (e.g. whoever pre-created the
+    // folder) rewrite the ACL and retake the directory.
     // D:P  = protected DACL (no inheritance from the parent folder)
     // OICI = object + container inherit (children inherit these ACEs)
     // FA   = full access for SYSTEM (SY) and Administrators (BA)
-    // GRGX = generic read/execute for Users (BU)
-    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    // GRGX = generic read/execute for Users (BU) in the policy ACL
+    // GW   = generic write for Users (BU) in the status ACL
+    let sddl: Vec<u16> = sddl_str.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let mut psd: PSECURITY_DESCRIPTOR = null_mut();
         let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -88,6 +110,13 @@ pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
             LocalFree(psd as HLOCAL);
             return Err(format!("Could not extract DACL for {}", path.display()));
         }
+        let mut owner: PSID = null_mut();
+        let mut owner_defaulted: i32 = 0;
+        let got_owner = GetSecurityDescriptorOwner(psd, &mut owner, &mut owner_defaulted);
+        if got_owner == 0 || owner.is_null() {
+            LocalFree(psd as HLOCAL);
+            return Err(format!("Could not extract owner for {}", path.display()));
+        }
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
@@ -96,8 +125,10 @@ pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
         let err = SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
             null_mut(),
             dacl as *const ACL,
             null_mut(),
@@ -110,6 +141,50 @@ pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
                 err
             ));
         }
+        // Verify the owner really is Administrators now: a silent no-op
+        // here would leave the WRITE_DAC loophole in place while the code
+        // claims the object is protected.
+        let mut actual_owner: PSID = null_mut();
+        let mut read_sd: PSECURITY_DESCRIPTOR = null_mut();
+        let rerr = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut actual_owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut read_sd,
+        );
+        if rerr != 0 || actual_owner.is_null() {
+            if !read_sd.is_null() {
+                LocalFree(read_sd as HLOCAL);
+            }
+            return Err(format!(
+                "Could not verify ACL owner for {} (Win32 error {})",
+                path.display(),
+                rerr
+            ));
+        }
+        let mut sid_str: windows_sys::core::PWSTR = null_mut();
+        let cok = ConvertSidToStringSidW(actual_owner, &mut sid_str);
+        let mut verified = false;
+        if cok != 0 && !sid_str.is_null() {
+            let mut len = 0usize;
+            while *sid_str.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len));
+            verified = s == "S-1-5-32-544";
+            LocalFree(sid_str as HLOCAL);
+        }
+        LocalFree(read_sd as HLOCAL);
+        if !verified {
+            return Err(format!(
+                "ACL owner verification failed for {} (owner is not Administrators)",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -119,6 +194,13 @@ pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
         .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?
         .join("bin");
     fs::create_dir_all(&base).map_err(|e| format!("Cannot create {}: {}", base.display(), e))?;
+    // The root folder itself is part of the trust boundary (the policy
+    // files and the autostart task XML live directly in it): prove its
+    // owner + DACL instead of assuming the best-effort startup call in
+    // biflow_programdata_dir succeeded.
+    if let Some(root) = base.parent() {
+        apply_protected_acl(root)?;
+    }
     // The DLL is loaded into other processes: its directory and the file
     // itself get the checked protected ACL, and a failure here fails the
     // extraction instead of injecting a DLL whose protection is assumed.
@@ -169,6 +251,9 @@ fn write_pd_policy_file(leaf: &str, content: &str) -> Result<(), String> {
     let dir = biflow_programdata_dir()
         .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?;
     fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
+    // The containing folder's owner + DACL are part of the policy's
+    // protection: prove them on every publish, not just the file's.
+    apply_protected_acl(&dir)?;
     let final_path = dir.join(leaf);
     let tmp_path = dir.join(format!(".{}-{}.tmp", leaf, std::process::id()));
     fs::write(&tmp_path, content)
@@ -222,14 +307,29 @@ pub fn clear_target_ip() -> Result<(), String> {
     }
 }
 
+/// The dedicated hook-status directory: `%ProgramData%\BiFlow\status`.
+/// It carries its own ACL (see STATUS_ACL_SDDL) that lets a target process
+/// running with the user's normal token create its status report — under
+/// the policy folder's read-only-for-users ACL the report could never be
+/// written and every injection timed out as "not live".
+pub fn hook_status_dir() -> Option<PathBuf> {
+    biflow_programdata_dir().map(|d| d.join("status"))
+}
+
+/// Creates the status directory and applies its ACL, best effort: if it
+/// cannot be prepared, the hook falls back to writing its report under
+/// %TEMP%\BiFlow and the reader checks there too, so injection still works.
+fn ensure_status_dir() {
+    if let Some(dir) = hook_status_dir() {
+        let _ = fs::create_dir_all(&dir);
+        let _ = apply_status_acl(&dir);
+    }
+}
+
 /// Removes hook status files left behind by processes that have exited.
 /// Called once at startup, before any new injection happens.
 pub fn clear_stale_hook_status() {
-    let mut dirs = vec![std::env::temp_dir().join("BiFlow")];
-    if let Ok(prog) = std::env::var("ProgramData") {
-        dirs.push(PathBuf::from(prog).join("BiFlow"));
-    }
-    for dir in dirs {
+    for dir in hook_status_dirs() {
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -244,7 +344,9 @@ pub fn clear_stale_hook_status() {
 fn hook_status_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(prog) = std::env::var("ProgramData") {
-        dirs.push(PathBuf::from(prog).join("BiFlow"));
+        let base = PathBuf::from(prog).join("BiFlow");
+        dirs.push(base.join("status"));
+        dirs.push(base);
     }
     dirs.push(std::env::temp_dir().join("BiFlow"));
     dirs
@@ -344,6 +446,15 @@ pub fn process_creation_time(pid: u32) -> Option<u64> {
 }
 
 pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
+    // Prepare the status-report directory and drop any stale report for
+    // this PID, so the wait at the end can only be satisfied by a report
+    // written for THIS injection (a leftover or planted file must not be
+    // able to fake a "live" result).
+    ensure_status_dir();
+    for dir in hook_status_dirs() {
+        let _ = fs::remove_file(dir.join(format!("hook_status_{}.txt", pid)));
+    }
+
     let wide_path: Vec<u16> = dll_path
         .as_os_str()
         .encode_wide()
@@ -419,7 +530,7 @@ pub fn inject_dll_into_pid(pid: u32, dll_path: &Path) -> Result<(), String> {
             .chain(std::iter::once(0))
             .collect();
         let kernel32 = GetModuleHandleW(kernel32_name.as_ptr());
-        let load_library_w = GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr());
+        let load_library_w = GetProcAddress(kernel32, c"LoadLibraryW".as_ptr() as *const u8);
 
         if load_library_w.is_none() {
             VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
