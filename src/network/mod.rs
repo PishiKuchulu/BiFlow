@@ -53,9 +53,11 @@ unsafe fn query_udp_table(af: u32, class: UDP_TABLE_CLASS) -> Option<Vec<u64>> {
     None
 }
 
-/// PIDs that are actively exchanging traffic: owners of ESTABLISHED TCP
-/// connections (v4 + v6) and of UDP endpoints. LISTEN/idle TCP sockets do
-/// not count, so "Active Internet" in the UI reflects real traffic.
+/// PIDs holding open connections: owners of ESTABLISHED TCP connections
+/// (v4 + v6) and of UDP endpoints. This is a socket snapshot, not a
+/// traffic meter: an ESTABLISHED connection may be idle and a UDP
+/// endpoint may only be bound, so the UI wording says "open connections",
+/// never "active traffic". LISTEN sockets do not count.
 pub fn get_active_network_pids() -> HashSet<u32> {
     let mut pids = HashSet::new();
     unsafe {
