@@ -42,6 +42,10 @@ pub struct AppState {
     pub pid_to_path: HashMap<u32, String>,
     pub active_network_pids: HashSet<u32>,
     pub active_profile_baseline: Vec<BypassRule>,
+    /// Last time profile rules were retried after a late adapter arrival,
+    /// and the adapter that attempt used (see maybe_retry_profile_apply).
+    pub last_profile_retry: Option<Instant>,
+    pub last_profile_retry_adapter: Option<u32>,
 }
 
 impl AppState {
@@ -177,6 +181,8 @@ impl AppState {
             pid_to_path,
             active_network_pids,
             active_profile_baseline: Vec::new(),
+            last_profile_retry: None,
+            last_profile_retry_adapter: None,
         };
 
         state.auto_discover_network_apps();
@@ -259,10 +265,23 @@ impl AppState {
         // the startup path, with a brief unblocked window in between.)
         if crate::windows::privilege::is_elevated() {
             for blocked_id in &state.store.blocked_apps {
-                match crate::windows::firewall::query_rule_directions(blocked_id) {
+                let app = state.apps.iter().find(|a| a.id == *blocked_id);
+                // When the app (and therefore its executable) is known,
+                // reconcile against the VERIFIED block state: a rule that
+                // merely exists with this name but is disabled, allows, or
+                // targets another program does not block anything and must
+                // be recreated. Without a known executable only presence
+                // can be checked.
+                let state_check = match app {
+                    Some(app) => {
+                        crate::windows::firewall::query_verified_block(blocked_id, &app.executable)
+                    }
+                    None => crate::windows::firewall::query_rule_directions(blocked_id),
+                };
+                match state_check {
                     Ok((true, true)) => continue,
                     Ok(_) => {
-                        if let Some(app) = state.apps.iter().find(|a| a.id == *blocked_id) {
+                        if let Some(app) = app {
                             let _ = crate::windows::firewall::block_app(
                                 blocked_id,
                                 &app.name,
@@ -305,9 +324,14 @@ impl AppState {
                 let maps = injector::get_process_maps();
                 let ifaces = network::interfaces().unwrap_or_default();
                 let idx = *adapter.lock().unwrap_or_else(|e| e.into_inner());
+                // APIPA is not a usable direct address: an adapter with
+                // only a link-local address counts as "no adapter", so the
+                // commit's fail-closed path applies instead of publishing
+                // a source IP that cannot route anywhere.
                 let ip = idx
                     .and_then(|i| ifaces.iter().find(|x| x.index == i))
-                    .and_then(|i| i.ipv4.clone());
+                    .and_then(|i| i.ipv4.clone())
+                    .filter(|ip| !network::is_apipa_ipv4(ip));
                 let snapshot = {
                     let mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
                     mgr.watchdog_snapshot()
@@ -340,8 +364,25 @@ impl AppState {
                         }
                     }
                 }
+                // Re-resolve the adapter address immediately before the
+                // commit: the plan/injection phase above can take seconds,
+                // and if the user switched adapters meanwhile, committing
+                // the address sampled at the top would publish the OLD
+                // adapter's IP as the bypass source. The snapshot-phase
+                // value is only a fallback if re-resolution fails outright.
+                let ifaces_now = network::interfaces().unwrap_or_default();
+                let idx_now = *adapter.lock().unwrap_or_else(|e| e.into_inner());
+                let fresh_ip = idx_now
+                    .and_then(|i| ifaces_now.iter().find(|x| x.index == i))
+                    .and_then(|i| i.ipv4.clone())
+                    .filter(|ip| !network::is_apipa_ipv4(ip));
+                let commit_ip = if ifaces_now.is_empty() {
+                    ip.as_deref()
+                } else {
+                    fresh_ip.as_deref()
+                };
                 let mut mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.watchdog_commit(plan, &injected, &errors, ip.as_deref());
+                mgr.watchdog_commit(plan, &injected, &errors, commit_ip);
             });
     }
 
@@ -360,6 +401,12 @@ impl AppState {
                 {
                     return Some(i.index);
                 }
+                // A saved GUID that matches nothing must NOT fall back to
+                // the saved IfIndex: interface indices are recycled when
+                // adapters are removed/reinstalled, so the stale index can
+                // now name a different adapter (even a VPN). Auto-detect
+                // instead of silently retargeting the bypass.
+                return Self::find_best_direct_interface(interfaces);
             }
         }
         if let Some(idx) = adapter_index {
@@ -546,19 +593,24 @@ impl AppState {
         false
     }
 
-    pub fn toggle_autostart(&mut self, enable: bool) {
-        if let Err(e) = autostart::set_autostart(enable) {
-            self.status = format!("Autostart setting error: {}", e);
-        } else {
-            self.store.autostart = enable;
-            // The registry/task is the source of truth and is re-synced at
-            // startup, so a failed config save does not change the outcome.
-            let _ = self.save();
-            self.status = if enable {
-                "BiFlow configured to start automatically with Windows.".into()
-            } else {
-                "BiFlow removed from Windows startup.".into()
-            };
+    pub fn toggle_autostart(&mut self, enable: bool) -> Result<(), String> {
+        match autostart::set_autostart(enable) {
+            Ok(()) => {
+                self.store.autostart = enable;
+                // The task is the source of truth and is re-synced at
+                // startup, so a failed config save does not change the outcome.
+                let _ = self.save();
+                self.status = if enable {
+                    "BiFlow configured to start automatically with Windows.".into()
+                } else {
+                    "BiFlow removed from Windows startup.".into()
+                };
+                Ok(())
+            }
+            Err(e) => {
+                self.status = format!("Autostart setting error: {}", e);
+                Err(e)
+            }
         }
     }
 
@@ -706,7 +758,7 @@ impl AppState {
                         return;
                     }
                     self.status = format!(
-                        "🚫 Internet access completely blocked for {}! Windows Firewall is now blocking all connections.",
+                        "🚫 Internet access blocked for {}: Windows Firewall now blocks its new connections (existing IPv6 connections end on their own).",
                         app.name
                     );
                 }
@@ -717,7 +769,7 @@ impl AppState {
         }
     }
 
-    pub fn unblock_all_apps(&mut self) {
+    pub fn unblock_all_apps(&mut self) -> Result<(), String> {
         match crate::windows::firewall::clear_all_blocked_rules(&self.store.blocked_apps) {
             Ok(()) => {
                 let count = self
@@ -728,16 +780,20 @@ impl AppState {
                 self.store.blocked_apps.clear();
                 self.store.blocked_executables.clear();
                 if self.save().is_err() {
-                    return;
+                    // save() left the error in self.status; the rules are
+                    // gone but the cleared list will not survive a restart.
+                    return Err("unblocked but not saved".into());
                 }
                 self.status = format!(
                     "✅ All {} blocked applications have been unblocked from Windows Firewall.",
                     count
                 );
+                Ok(())
             }
             Err(e) => {
                 // Keep the blocked list: the rules are still in the firewall.
                 self.status = format!("Failed to unblock all applications: {}", e);
+                Err(e)
             }
         }
     }
@@ -1004,6 +1060,34 @@ impl AppState {
 
     pub fn bypasses_paused(&self) -> bool {
         self.bypass_paused
+    }
+
+    /// Cleanup that must succeed before the process exits: clears the live
+    /// bypasses and deletes the policy files, and reports failure instead
+    /// of letting the caller exit anyway. Already-injected hooks keep
+    /// bypassing while the policy files exist, so exiting on a failed
+    /// cleanup would silently leave the bypass running with no UI left to
+    /// stop it. On Err the reason is in self.status and the caller must
+    /// keep the app running.
+    pub fn exit_cleanup(&mut self) -> Result<(), String> {
+        let mut errs: Vec<String> = Vec::new();
+        if let Err(e) = self.manager().clear_all() {
+            errs.push(e);
+        }
+        if let Err(e) = injector::clear_target_ip() {
+            errs.push(e);
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            let msg = errs.join("; ");
+            config::append_log(&format!("EXIT_CLEANUP_FAILED {}", msg));
+            self.status = format!(
+                "Exit blocked: bypass cleanup failed ({}). Already-injected processes may keep bypassing until cleanup succeeds; fix the problem and try Exit again.",
+                msg
+            );
+            Err(msg)
+        }
     }
 
     pub fn resume_all(&mut self) {
@@ -1396,6 +1480,58 @@ impl AppState {
         if self.last_watchdog.elapsed().as_millis() > 1500 {
             self.last_watchdog = Instant::now();
             self.update_running_cache();
+            self.maybe_retry_profile_apply();
+        }
+    }
+
+    /// Retries the active profile's rules when a usable adapter appears
+    /// after startup. At startup, apply_active_profile_rules silently does
+    /// nothing when no direct adapter is ready yet (cable unplugged, Wi-Fi
+    /// still connecting), and nothing re-ran it when the adapter arrived —
+    /// the profile stayed inert until the user toggled something. Attempts
+    /// are throttled to an adapter change or one per 15 s while the
+    /// manager has no registered rules.
+    fn maybe_retry_profile_apply(&mut self) {
+        if self.active_bypass_count() > 0 {
+            return;
+        }
+        let Some(direct) = self.direct_interface().cloned() else {
+            return;
+        };
+        let usable = direct
+            .ipv4
+            .as_deref()
+            .map(|ip| !network::is_apipa_ipv4(ip))
+            .unwrap_or(false);
+        if !usable {
+            return;
+        }
+        let has_pending_rules = match self.store.active_profile {
+            Some(pid) => self
+                .store
+                .profiles
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.enabled && p.rules.iter().any(|r| r.enabled))
+                .unwrap_or(false),
+            None => false,
+        };
+        if !has_pending_rules {
+            return;
+        }
+        let adapter_changed = self.last_profile_retry_adapter != self.selected_direct_if;
+        let due = self
+            .last_profile_retry
+            .map(|t| t.elapsed().as_secs() >= 15)
+            .unwrap_or(true);
+        if !adapter_changed && !due {
+            return;
+        }
+        self.last_profile_retry = Some(Instant::now());
+        self.last_profile_retry_adapter = self.selected_direct_if;
+        let (applied, _failed) = self.apply_active_profile_rules();
+        if applied > 0 {
+            self.recompute_paused();
         }
     }
 }
