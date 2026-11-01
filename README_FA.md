@@ -3,7 +3,7 @@
 # ⚡ بای‌فلو (BiFlow)
 
 <p align="center">
-  <img src="assets/biflow_icon.jpg" alt="BiFlow Logo" width="130" style="border-radius: 20px;" />
+  <img src="assets/icon_256.png" alt="BiFlow Logo" width="130" style="border-radius: 20px;" />
 </p>
 
 <p align="center">
