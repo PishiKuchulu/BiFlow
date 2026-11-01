@@ -217,10 +217,12 @@ impl BiFlowApp {
         }
 
         // 2b. Handle Exit Request from Tray (orderly shutdown on this
-        // thread, so no config save can be interrupted mid-write)
-        if windows::tray::take_exit_requested() {
-            self.state.disable_all();
-            let _ = windows::injector::clear_target_ip();
+        // thread, so no config save can be interrupted mid-write). Exit
+        // only happens when the bypass cleanup actually succeeded: if the
+        // policy files could not be deleted, already-injected processes
+        // would keep bypassing with no UI left, so the app stays alive
+        // and the failure is left in the status/log instead.
+        if windows::tray::take_exit_requested() && self.state.exit_cleanup().is_ok() {
             std::process::exit(0);
         }
 
@@ -231,10 +233,10 @@ impl BiFlowApp {
                 self.is_hidden = true;
                 windows::hide_main_window();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else {
-                self.state.disable_all();
-                let _ = windows::injector::clear_target_ip();
+            } else if self.state.exit_cleanup().is_ok() {
                 std::process::exit(0);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
 
@@ -370,9 +372,8 @@ impl BiFlowApp {
                     )
                     .on_hover_text("Close BiFlow and stop all bypasses (firewall block rules you created stay in Windows Firewall until you unblock them)")
                     .clicked()
+                    && self.state.exit_cleanup().is_ok()
                 {
-                    self.state.disable_all();
-                    let _ = windows::injector::clear_target_ip();
                     std::process::exit(0);
                 }
 
@@ -1056,11 +1057,18 @@ impl BiFlowApp {
                 )
                 .changed()
             {
-                self.state.toggle_autostart(autostart_val);
-                self.save_notification = Some(if autostart_val {
-                    "✔ Windows startup enabled successfully.".into()
-                } else {
-                    "✔ Windows startup disabled.".into()
+                // The notification follows the real result: a failed toggle
+                // (protected-location refusal, task creation/removal
+                // failure) must never render as a green success.
+                self.save_notification = Some(match self.state.toggle_autostart(autostart_val) {
+                    Ok(()) => {
+                        if autostart_val {
+                            "✔ Windows startup enabled successfully.".into()
+                        } else {
+                            "✔ Windows startup disabled.".into()
+                        }
+                    }
+                    Err(_) => format!("✖ {}", self.state.status.clone()),
                 });
             }
 
@@ -1302,8 +1310,8 @@ impl BiFlowApp {
         ui.group(|ui| {
             ui.heading("🛡️ Windows Firewall & Internet Killswitch");
             ui.label(
-                "BiFlow directly controls Windows Defender Firewall to instantly and completely block \
-                network and internet access for any application.",
+                "BiFlow controls Windows Defender Firewall to block new network connections \
+                for any application (verified by readback after every change).",
             );
             ui.add_space(4.0);
 
@@ -1311,9 +1319,12 @@ impl BiFlowApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Currently Blocked: {} applications", blocked_count));
                 if blocked_count > 0 && ui.button("🧹 Unblock All Applications").clicked() {
-                    self.state.unblock_all_apps();
-                    self.save_notification =
-                        Some("✔ All applications have been unblocked from Windows Firewall.".into());
+                    self.save_notification = Some(match self.state.unblock_all_apps() {
+                        Ok(()) => {
+                            "✔ All applications have been unblocked from Windows Firewall.".into()
+                        }
+                        Err(_) => format!("✖ {}", self.state.status.clone()),
+                    });
                 }
             });
 
@@ -1358,7 +1369,7 @@ impl BiFlowApp {
                     .size(14.0)
                     .color(egui::Color32::from_rgb(56, 189, 248)),
             );
-            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.3.1");
+            ui.label("BiFlow - Windows Per-App Split Routing Tool • Version 0.3.2");
             ui.label(format!(
                 "Configuration path: {}",
                 config::store_path().display()
@@ -1428,9 +1439,9 @@ impl BiFlowApp {
             ui.heading("🌟 Core Capabilities");
             ui.add_space(4.0);
             ui.label("• Zero-Lag Process Scanning: Instant in-memory cache lookup for 120 FPS fluid scrolling.");
-            ui.label("• Active Internet Connection Detection: Automatic detection of apps with open TCP/UDP sockets.");
+            ui.label("• Open-Connection Detection: Lists apps holding established TCP connections or UDP endpoints (a socket snapshot, not a traffic meter).");
             ui.label("• Seamless System Tray Docking: Instant minimize, restore, and safe background execution.");
-            ui.label("• Windows Startup Integration: Built-in registry auto-run for effortless persistence.");
+            ui.label("• Windows Startup Integration: Task Scheduler logon task (protected install locations only).");
             ui.label("• Non-Destructive Winsock Hooking: No routing table corruption, no global IP metric manipulation.");
         });
 
