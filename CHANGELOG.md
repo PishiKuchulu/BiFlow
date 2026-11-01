@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.3.2 — 2026-11-01
+
+Third external review (14 findings: 4 P1 + 8 P2 + 2 P3, of v0.3.1 @
+8506813) verified line-by-line against the source; every finding was
+confirmed in code (BF-12 additionally against crates.io metadata) and is
+fixed below. Runtime behaviour on real Windows remains the open
+verification item, as with previous releases.
+
+### Hook status reporting (BF-01)
+- The hook's status report could never be written: it lived in the
+  policy folder, whose ACL gives standard users read/execute only, while
+  the hook runs inside target processes at the user's normal integrity —
+  so injections timed out and "Launch Direct" terminated the launched
+  process. Status reports now live in a dedicated `status` subfolder
+  whose ACL grants users write access, the hook falls back to
+  `%TEMP%\BiFlow` when the report cannot be written there, and BiFlow
+  deletes any stale report for a PID before injecting.
+
+### Elevated trust boundary (BF-02, BF-03)
+- System tools (`netsh`, `schtasks`, `powershell`) are now launched by
+  absolute System32 path (resolved via `GetSystemDirectoryW`), never by
+  bare name: CreateProcessW searches the executable's own folder before
+  System32, so a planted same-named binary next to a portable BiFlow
+  would have run with BiFlow's administrator token.
+- The ProgramData ACL application now also sets and verifies the owner
+  (Administrators): an object's owner implicitly holds WRITE_DAC, so the
+  previous DACL-only protection let the folder's creator rewrite the
+  ACL. The protected ACL is now applied (checked) to the root folder on
+  the DLL-extraction and policy-publish paths, and to the autostart
+  task XML; the XML's `%TEMP%` fallback location is removed.
+
+### Autostart task (BF-04)
+- Registering the logon task is refused when BiFlow runs from a
+  user-writable location: the task executes `current_exe` with
+  HighestAvailable, so a replaceable portable binary would have been an
+  elevation/persistence vector (LIMITATIONS.md #19).
+- Disabling autostart now verifies the task is actually gone (the
+  `schtasks /Delete` result was ignored), and the settings UI reports
+  the real result instead of an unconditional success.
+
+### Enforcement correctness (BF-05..BF-10)
+- Helper/descendant processes the watchdog injects are now published on
+  the policy allow-list with the app's own path: previously they were
+  hooked (and shown Live) but their own path was not listed, so the
+  hook never bypassed them. The list republishes when the effective
+  set changes.
+- Profile rules that could not be applied at startup (no usable
+  adapter yet) are retried automatically when an adapter appears
+  (throttled), instead of staying inert until a manual toggle.
+- An APIPA (link-local) address is no longer accepted as a usable
+  direct IPv4 — not at apply/launch time and not in the watchdog, where
+  it now counts as "adapter unavailable" (fail-closed path).
+- A saved adapter GUID that no longer matches anything no longer falls
+  back to the saved IfIndex (indices are recycled and can name a
+  different adapter); auto-detection is used instead.
+- The watchdog re-resolves the adapter address immediately before
+  committing, so a mid-cycle adapter switch can no longer publish the
+  previous adapter's IP.
+- Exit (button, tray, window close) no longer ignores policy-cleanup
+  failures: if the policy files cannot be deleted, the app stays
+  running and reports it, instead of exiting while already-injected
+  processes keep bypassing.
+
+### Firewall verification (BF-11)
+- Rule readback is structured (PowerShell firewall objects) instead of
+  name-substring matching in netsh text: a block counts only when the
+  rule is enabled, blocks, and targets exactly the app's executable —
+  per direction. This also removes the dependency on netsh's localized
+  "No rules match" sentence.
+- The "Unblock All" purge is a checked operation and afterwards ALL
+  remaining `BiFlow_Block*` rules are enumerated, so orphans can no
+  longer survive a reported success; the settings UI follows the real
+  result. Wording that claimed "complete/instant" blocking was
+  corrected.
+
+### Build & docs (BF-12, BF-13, BF-14)
+- Declared MSRV corrected from 1.74 to 1.90 (the locked `tray-icon`
+  0.26.0 requires 1.90 and `eframe`/`egui` 0.33.3 require 1.88), with a
+  CI job that checks the build on the declared toolchain.
+- "Active Internet" wording corrected to what is measured: established
+  TCP connections / UDP endpoints (a socket snapshot, not traffic).
+- SECURITY.md no longer describes the removed `%TEMP%` policy copies;
+  the About tab says Task Scheduler (not "registry auto-run"); the
+  README logo points at the existing `assets/icon_256.png`;
+  LIMITATIONS.md numbering is sequential again (the v0.3.1 items
+  formerly numbered 15–18 are now 11–14).
+
 ## v0.3.1 — 2026-10-25
 
 Second external review (16 findings: 7 P1 + 10 P2, of v0.3.0) verified
