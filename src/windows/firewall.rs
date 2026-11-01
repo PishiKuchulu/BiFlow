@@ -52,15 +52,17 @@ pub fn block_app(app_id: &Uuid, app_name: &str, exe_path: &str) -> Result<(), St
             }
         }
 
-        // Verify BOTH directions separately: a rule with this name in one
-        // direction must never mask a missing rule in the other direction,
-        // and a failed query is "unknown", never "absent".
-        let mut dirs = query_rule_directions(app_id);
+        // Verify BOTH directions separately, and verify the rules really
+        // block THIS executable: a rule with this name in one direction
+        // must never mask a missing rule in the other, name-only presence
+        // must never mask a disabled or foreign rule, and a failed query
+        // is "unknown", never "absent".
+        let mut dirs = query_verified_block(app_id, clean_path);
         if !matches!(dirs, Ok((true, true))) {
             // Fall back to PowerShell (with the same rule -Name, so the
-            // netsh readback below can see what it created), then retry.
+            // readback below can see what it created), then retry.
             run_powershell_block(&name, clean_path);
-            dirs = query_rule_directions(app_id);
+            dirs = query_verified_block(app_id, clean_path);
         }
         match dirs {
             Ok((true, true)) => {}
@@ -125,7 +127,7 @@ fn run_powershell_block(name: &str, clean_path: &str) {
         name,
         clean_path.replace('\'', "''"),
     );
-    let _ = Command::new("powershell")
+    let _ = Command::new(crate::windows::system_powershell())
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_add])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -174,49 +176,117 @@ pub fn unblock_app(app_id: &Uuid) -> Result<(), String> {
     Ok(())
 }
 
-/// Query whether the block rule exists, separately per direction.
-/// Returns Err when the query itself fails: "unknown" must never be read
-/// as "absent". A "No rules match" answer counts as absent even if netsh
-/// reports it with a non-zero exit code.
-pub fn query_rule_directions(app_id: &Uuid) -> Result<(bool, bool), String> {
-    fn query_one(name: &str, dir: &str) -> Result<bool, String> {
-        if !crate::windows::privilege::is_elevated() {
-            return Err("netsh requires BiFlow to run as Administrator.".into());
-        }
-        let output = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "show",
-                "rule",
-                &format!("name={}", name),
-                &format!("dir={}", dir),
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Failed to execute netsh: {}", e))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if stdout.contains("No rules match") || stderr.contains("No rules match") {
-            return Ok(false);
-        }
-        if !output.status.success() {
-            let msg = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                format!("netsh failed with exit code {:?}", output.status.code())
-            };
-            return Err(msg);
-        }
-        Ok(stdout.contains(name))
-    }
+/// One firewall rule as reported by the structured PowerShell query.
+/// Property names and enum values come from the API objects, so they are
+/// identical on every Windows display language — unlike netsh text output,
+/// whose "No rules match" sentence (the old absence test) is localized.
+struct FwRule {
+    direction_out: bool,
+    enabled: bool,
+    block: bool,
+    program: String,
+}
 
-    let name = rule_name(app_id);
-    let out = query_one(&name, "out")?;
-    let inn = query_one(&name, "in")?;
-    Ok((out, inn))
+/// Structured readback of every rule with the given -Name (empty when none
+/// exist). Returns Err when the query itself fails: "unknown" must never
+/// be read as "absent".
+fn query_rules_ps(name: &str) -> Result<Vec<FwRule>, String> {
+    if !crate::windows::privilege::is_elevated() {
+        return Err("Firewall queries require BiFlow to run as Administrator.".into());
+    }
+    let script = "$rs = Get-NetFirewallRule -Name '__NAME__' -ErrorAction SilentlyContinue; foreach ($r in $rs) { $a = $r | Get-NetFirewallApplicationFilter; Write-Output (\"{0}|{1}|{2}|{3}\" -f $r.Direction, $r.Enabled, $r.Action, $a.Program) }"
+        .replace("__NAME__", name);
+    let output = Command::new(crate::windows::system_powershell())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PowerShell firewall query failed with exit code {:?}",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rules = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() == 4 {
+            rules.push(FwRule {
+                direction_out: parts[0].trim().eq_ignore_ascii_case("Outbound"),
+                enabled: parts[1].trim().eq_ignore_ascii_case("True"),
+                block: parts[2].trim().eq_ignore_ascii_case("Block"),
+                program: parts[3].trim().trim_matches('"').to_string(),
+            });
+        }
+    }
+    Ok(rules)
+}
+
+/// Names of every rule matching a -Name pattern (used to enumerate orphan
+/// BiFlow rules after a purge, not just the IDs the caller remembered).
+fn query_rule_names_ps(pattern: &str) -> Result<Vec<String>, String> {
+    if !crate::windows::privilege::is_elevated() {
+        return Err("Firewall queries require BiFlow to run as Administrator.".into());
+    }
+    let script = "Get-NetFirewallRule -Name '__PATTERN__' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }"
+        .replace("__PATTERN__", pattern);
+    let output = Command::new(crate::windows::system_powershell())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PowerShell firewall query failed with exit code {:?}",
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Query whether a rule with this app's name exists, separately per
+/// direction (any state: this is the presence test used to verify
+/// removals). Returns Err when the query itself fails.
+pub fn query_rule_directions(app_id: &Uuid) -> Result<(bool, bool), String> {
+    let rules = query_rules_ps(&rule_name(app_id))?;
+    Ok((
+        rules.iter().any(|r| r.direction_out),
+        rules.iter().any(|r| !r.direction_out),
+    ))
+}
+
+/// Verified block state, separately per direction: a rule counts only
+/// when it is enabled, blocks, and targets exactly this executable. Mere
+/// name presence is not proof of blocking — a disabled rule, a rule for a
+/// different program, or a leftover from another tool can share the name
+/// while the app's traffic flows freely.
+pub fn query_verified_block(app_id: &Uuid, exe_path: &str) -> Result<(bool, bool), String> {
+    let rules = query_rules_ps(&rule_name(app_id))?;
+    let want = exe_path.trim().trim_matches('"');
+    let is_block = |r: &FwRule| r.enabled && r.block && r.program.eq_ignore_ascii_case(want);
+    Ok((
+        rules.iter().any(|r| r.direction_out && is_block(r)),
+        rules.iter().any(|r| !r.direction_out && is_block(r)),
+    ))
 }
 
 pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
@@ -233,13 +303,39 @@ pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
         ));
     }
 
-    // Comprehensive purge: remove any orphaned BiFlow rules in one operation.
-    script_lines.push(
-        "powershell -NoProfile -WindowStyle Hidden -Command \"Remove-NetFirewallRule -Name 'BiFlow_Block*' -ErrorAction SilentlyContinue\"".to_string(),
-    );
-
     for line in &script_lines {
         let _ = run_netsh_line(line);
+    }
+
+    // Comprehensive purge: remove any orphaned BiFlow rules (left behind
+    // by removed apps or older versions) in one operation. This runs as a
+    // CHECKED operation: previously it was a fire-and-forget line whose
+    // failure was invisible, so orphans could survive a "successful" clear.
+    let purge = Command::new(crate::windows::system_powershell())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Remove-NetFirewallRule -Name 'BiFlow_Block*' -ErrorAction SilentlyContinue",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match purge {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return Err(format!(
+                "The orphan firewall-rule purge failed with exit code {:?}",
+                out.status.code()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "Failed to run the orphan firewall-rule purge: {}",
+                e
+            ));
+        }
     }
 
     // Verify per ID with a real readback, and report every ID that failed:
@@ -258,6 +354,20 @@ pub fn clear_all_blocked_rules(app_ids: &[Uuid]) -> Result<(), String> {
             Err(e) => {
                 failures.push(format!("{} (verification failed: {})", id, e));
             }
+        }
+    }
+    // Enumerate ALL remaining BiFlow rules, not just the caller's IDs:
+    // an orphan the caller forgot must not survive a reported success.
+    match query_rule_names_ps("BiFlow_Block*") {
+        Ok(names) if names.is_empty() => {}
+        Ok(names) => {
+            failures.push(format!(
+                "orphan rule(s) still present: {}",
+                names.join(", ")
+            ));
+        }
+        Err(e) => {
+            failures.push(format!("orphan check failed: {}", e));
         }
     }
     if !failures.is_empty() {
@@ -286,7 +396,7 @@ fn run_netsh_line(line: &str) -> Result<String, String> {
 fn run_powershell_line(line: &str) -> Result<String, String> {
     // line shape: powershell -NoProfile -WindowStyle Hidden -Command "<script>"
     let script = extract_ps_command(line).unwrap_or(line);
-    let output = Command::new("powershell")
+    let output = Command::new(crate::windows::system_powershell())
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -335,7 +445,7 @@ fn split_cmd_line(line: &str) -> Vec<String> {
 
 fn run_netsh(args: &[&str]) -> Result<String, String> {
     if crate::windows::privilege::is_elevated() {
-        let output = Command::new("netsh")
+        let output = Command::new(crate::windows::system_tool("netsh.exe"))
             .args(args)
             .creation_flags(CREATE_NO_WINDOW)
             .output()
