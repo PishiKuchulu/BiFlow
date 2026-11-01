@@ -8,11 +8,33 @@ const APP_NAME: &str = "BiFlow";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn task_exists() -> bool {
-    let task_check = Command::new("schtasks")
+    // Absolute System32 path: an elevated process must never resolve
+    // system tools by bare name (the executable's own folder is searched
+    // before System32).
+    let task_check = Command::new(crate::windows::system_tool("schtasks.exe"))
         .args(["/Query", "/TN", APP_NAME])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     matches!(task_check, Ok(out) if out.status.success())
+}
+
+/// True when the executable lives under a location that standard users
+/// cannot write to (Program Files / ProgramData roots). The logon task
+/// runs the executable with HighestAvailable, so registering it from a
+/// user-writable folder (a portable copy in Downloads, say) would let any
+/// same-user process replace the binary and have its code run at the next
+/// logon with the full administrator token.
+fn exe_dir_is_protected(exe: &std::path::Path) -> bool {
+    let exe_str = exe.to_string_lossy().to_ascii_lowercase();
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+        if let Ok(root) = env::var(var) {
+            let root = root.trim_end_matches('\\').to_ascii_lowercase();
+            if !root.is_empty() && exe_str.starts_with(&format!("{}\\", root)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn run_key_present() -> bool {
@@ -108,11 +130,12 @@ fn remove_run_key() {
     }
 }
 
-fn delete_task() {
-    let _ = Command::new("schtasks")
+fn delete_task() -> bool {
+    let out = Command::new(crate::windows::system_tool("schtasks.exe"))
         .args(["/Delete", "/TN", APP_NAME, "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
+    matches!(out, Ok(o) if o.status.success())
 }
 
 pub fn set_autostart(enable: bool) -> Result<(), String> {
@@ -120,11 +143,24 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
         let exe = env::current_exe()
             .map_err(|e| format!("Failed to get current executable path: {}", e))?;
 
+        // The logon task runs this executable with HighestAvailable. From a
+        // user-writable location the binary could be replaced by any
+        // same-user process and the replacement would run elevated at the
+        // next logon, so registration is refused there (see
+        // exe_dir_is_protected).
+        if !exe_dir_is_protected(&exe) {
+            return Err(
+                "Autostart requires BiFlow to run from a protected location (for example C:\\Program Files\\BiFlow). A copy in a user-writable folder cannot register an elevated logon task."
+                    .into(),
+            );
+        }
+
         // The XML file is written into the ACL-protected ProgramData folder,
         // not %TEMP%: it is handed to an elevated scheduler, so its location
-        // must not be writable by non-elevated processes.
-        let xml_dir =
-            crate::windows::injector::biflow_programdata_dir().unwrap_or_else(std::env::temp_dir);
+        // must not be writable by non-elevated processes. There is no TEMP
+        // fallback: if the protected folder is unavailable, fail honestly.
+        let xml_dir = crate::windows::injector::biflow_programdata_dir()
+            .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?;
         let xml_path = xml_dir.join("biflow_autostart_task.xml");
         // schtasks /XML expects a UTF-16LE file.
         let xml = task_xml(&exe);
@@ -134,8 +170,14 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
         }
         std::fs::write(&xml_path, &bytes)
             .map_err(|e| format!("Failed to write autostart task XML: {}", e))?;
+        // The XML defines an elevated task; prove its protection instead of
+        // relying on whatever the folder happened to inherit.
+        if let Err(e) = crate::windows::injector::apply_protected_acl(&xml_path) {
+            let _ = std::fs::remove_file(&xml_path);
+            return Err(format!("Failed to protect autostart task XML: {}", e));
+        }
 
-        let out = Command::new("schtasks")
+        let out = Command::new(crate::windows::system_tool("schtasks.exe"))
             .args([
                 "/Create",
                 "/TN",
@@ -173,6 +215,14 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         delete_task();
         remove_run_key();
+        // Verify the task is really gone: previously the delete result was
+        // ignored and the UI reported "disabled" while the task (and its
+        // elevated logon run) stayed registered.
+        if task_exists() {
+            return Err(
+                "The BiFlow logon task could not be removed (it is still registered).".into(),
+            );
+        }
         Ok(())
     }
 }
