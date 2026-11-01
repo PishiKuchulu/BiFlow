@@ -1,4 +1,4 @@
-use crate::{config, models::InterfaceInfo, windows::injector};
+use crate::{config, models::InterfaceInfo, network, windows::injector};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -22,6 +22,13 @@ pub struct ActiveBypass {
     /// well as PID means a recycled PID is never mistaken for the process
     /// that was originally injected.
     pub injected_pids: HashMap<u32, u64>,
+    /// Executable paths of descendant/helper processes the watchdog
+    /// injects for this app (same install tree, verified parent chain).
+    /// The hook only bypasses processes whose own path is on the policy
+    /// allow-list, so these paths are published alongside the app's own:
+    /// without them a helper was hooked (and shown Live) but never
+    /// actually bypassed. Maintained by watchdog_plan/watchdog_commit.
+    pub helper_paths: HashSet<String>,
     /// True when the app was not running at apply time; the watchdog injects on launch.
     pub awaiting_process: bool,
     /// Set when the app was running but every injection attempt failed.
@@ -57,6 +64,9 @@ pub struct WatchdogPlanEntry {
     pub pruned_injected: HashMap<u32, u64>,
     pub had_pids: bool,
     pub to_inject: Vec<u32>,
+    /// Executable paths of currently-running descendant processes (the
+    /// allow-list additions for this cycle; see ActiveBypass::helper_paths).
+    pub helper_paths: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +76,11 @@ pub struct EnforcementManager {
     /// Consecutive watchdog cycles that saw no usable direct adapter IPv4.
     /// After two cycles the policy is fail-closed (see watchdog_commit).
     adapter_missing_cycles: u32,
+    /// Lowercased allow-list paths as last successfully published, so the
+    /// watchdog can republish only when the effective set changes (a new
+    /// helper appeared, a helper exited) instead of rewriting the policy
+    /// files every cycle.
+    published_allow: HashSet<String>,
 }
 
 impl EnforcementManager {
@@ -74,18 +89,32 @@ impl EnforcementManager {
     /// When nothing is active, all policy files are deleted, which the hook
     /// interprets as "bypass disabled". Failures are returned: a caller
     /// must never treat a bypass as live when its policy was not published.
-    fn sync_policy_files(&self) -> Result<(), String> {
+    fn sync_policy_files(&mut self) -> Result<(), String> {
         match &self.target_ip {
             Some(ip) if !self.active.is_empty() => {
                 injector::update_target_ip(ip)?;
-                let paths: Vec<String> = self
-                    .active
-                    .values()
-                    .map(|b| b.exe_path.to_string_lossy().to_string())
-                    .collect();
-                injector::update_bypass_app_list(&paths)
+                // The allow-list is every path the hook must bypass: each
+                // app's own executable PLUS the helper/descendant paths the
+                // watchdog injected for it. A hooked process whose path is
+                // missing here loads the DLL but never bypasses.
+                let mut set: HashSet<String> = HashSet::new();
+                for b in self.active.values() {
+                    set.insert(b.exe_path.to_string_lossy().to_string());
+                    for h in &b.helper_paths {
+                        set.insert(h.clone());
+                    }
+                }
+                let mut paths: Vec<String> = set.iter().cloned().collect();
+                paths.sort();
+                injector::update_bypass_app_list(&paths)?;
+                self.published_allow = set.iter().map(|s| s.to_ascii_lowercase()).collect();
+                Ok(())
             }
-            _ => injector::clear_target_ip(),
+            _ => {
+                injector::clear_target_ip()?;
+                self.published_allow.clear();
+                Ok(())
+            }
         }
     }
 
@@ -99,6 +128,14 @@ impl EnforcementManager {
             .ipv4
             .clone()
             .ok_or("Direct interface has no valid IPv4 address")?;
+        // An APIPA (link-local) address is not a usable source: the adapter
+        // has no DHCP lease, so binding to it cannot reach anything. Treat
+        // it exactly like a missing IPv4 instead of publishing it.
+        if network::is_apipa_ipv4(&source_ip) {
+            return Err(
+                "Direct interface has only an APIPA (link-local) address; no usable IPv4".into(),
+            );
+        }
 
         let dll_path = injector::ensure_dll_extracted()?;
         let prev_ip = self.target_ip.clone();
@@ -147,6 +184,7 @@ impl EnforcementManager {
                 exe_path: exe.clone(),
                 exe_name: exe_name.clone(),
                 injected_pids,
+                helper_paths: HashSet::new(),
                 awaiting_process,
                 inject_error: inject_error.clone(),
             },
@@ -195,6 +233,11 @@ impl EnforcementManager {
             .ipv4
             .clone()
             .ok_or("Direct interface has no valid IPv4 address")?;
+        if network::is_apipa_ipv4(&source_ip) {
+            return Err(
+                "Direct interface has only an APIPA (link-local) address; no usable IPv4".into(),
+            );
+        }
 
         let exe_name = exe
             .file_name()
@@ -215,6 +258,7 @@ impl EnforcementManager {
                 exe_path: exe.to_path_buf(),
                 exe_name: exe_name.clone(),
                 injected_pids: HashMap::new(),
+                helper_paths: HashSet::new(),
                 awaiting_process: false,
                 inject_error: None,
             },
@@ -367,6 +411,7 @@ impl EnforcementManager {
 
             // Descendants running from the same install tree (helper
             // processes of launchers/multi-process apps).
+            let mut helper_paths: Vec<String> = Vec::new();
             if let Some(dir) = &app_dir {
                 let prefix = format!("{}\\", dir.trim_end_matches('\\'));
                 let descendants: Vec<u32> = paths
@@ -393,6 +438,18 @@ impl EnforcementManager {
                         false
                     })
                     .collect();
+                // The descendants' own paths go on the policy allow-list:
+                // the hook checks each process against ITS OWN path, so an
+                // injected helper that is not listed never bypasses.
+                for pid in &descendants {
+                    if let Some(p) = paths.get(pid) {
+                        if !p.eq_ignore_ascii_case(&bypass.exe_path.to_string_lossy())
+                            && !helper_paths.iter().any(|h| h.eq_ignore_ascii_case(p))
+                        {
+                            helper_paths.push(p.clone());
+                        }
+                    }
+                }
                 current.extend(descendants);
             }
 
@@ -420,6 +477,7 @@ impl EnforcementManager {
                 pruned_injected: pruned,
                 had_pids: !current.is_empty(),
                 to_inject,
+                helper_paths,
             });
         }
         out
@@ -485,6 +543,7 @@ impl EnforcementManager {
                 }
             }
             bypass.injected_pids = injected_pids;
+            bypass.helper_paths = entry.helper_paths.iter().cloned().collect();
             if bypass.injected_pids.is_empty() {
                 if entry.had_pids {
                     bypass.awaiting_process = false;
@@ -499,6 +558,25 @@ impl EnforcementManager {
             } else {
                 bypass.awaiting_process = false;
                 bypass.inject_error = None;
+            }
+        }
+
+        // Keep the published allow-list in step with the processes the
+        // watchdog actually injected this cycle (helpers appearing or
+        // exiting change the effective set). Republish only on change, so
+        // the policy files are not rewritten every cycle.
+        if self.target_ip.is_some() && !self.active.is_empty() {
+            let mut desired: HashSet<String> = HashSet::new();
+            for b in self.active.values() {
+                desired.insert(b.exe_path.to_string_lossy().to_ascii_lowercase());
+                for h in &b.helper_paths {
+                    desired.insert(h.to_ascii_lowercase());
+                }
+            }
+            if desired != self.published_allow {
+                if let Err(e) = self.sync_policy_files() {
+                    config::append_log(&format!("POLICY_SYNC_FAILED {}", e));
+                }
             }
         }
     }
@@ -541,6 +619,7 @@ mod tests {
                 exe_path: PathBuf::from("C:\\a.exe"),
                 exe_name: "a.exe".into(),
                 injected_pids: HashMap::new(),
+                helper_paths: HashSet::new(),
                 awaiting_process: true,
                 inject_error: None,
             },
