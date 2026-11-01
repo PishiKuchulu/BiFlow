@@ -10,7 +10,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-// BiFlow Winsock hook DLL (v0.3.1).
+// BiFlow Winsock hook DLL (v0.3.2).
 //
 // Strategy: outbound client sockets are bound to the IPv4 address of the
 // physical ("direct") adapter BiFlow selected. On Windows, binding a socket to
@@ -44,8 +44,13 @@
 // apps keep theirs. Already-established connections are never migrated.
 //
 // After installing its hooks the DLL writes a status file
-// (hook_status_<pid>.txt next to the policy files) so BiFlow can distinguish
-// "DLL loaded" from "hooks actually active".
+// (hook_status_<pid>.txt in the status subfolder next to the policy files,
+// falling back to %TEMP%\BiFlow when that folder cannot be written) so
+// BiFlow can distinguish "DLL loaded" from "hooks actually active". The
+// status folder's ACL grants normal user tokens write access: this DLL
+// runs inside target processes at the user's normal integrity level, and
+// under the policy folder's read-only ACL the report could never be
+// written, so every injection looked "not live" to BiFlow.
 //
 // All file/path handling uses the wide (W) APIs and the allow-list is decoded
 // as UTF-8, so user names and install paths containing non-ASCII characters
@@ -76,9 +81,9 @@ static pfn_WSASendTo g_real_WSASendTo = NULL;
 static pfn_bind g_real_bind = NULL;
 
 // Policy file paths, built once by the init thread before hooks are enabled.
-// Only ProgramData paths exist for policy now; the status file falls back
-// to TEMP only when ProgramData itself is unavailable (it is a report, not
-// policy, and is never read as policy).
+// Only ProgramData paths exist for policy now; the status report lives in
+// the status subfolder there and falls back to TEMP when it cannot be
+// written (it is a report, not policy, and is never read as policy).
 static wchar_t g_path_target_pd[1024];
 static wchar_t g_path_apps_pd[1024];
 static wchar_t g_path_status[1024];
@@ -138,7 +143,8 @@ static void build_policy_paths(void) {
     _snwprintf_s(g_path_apps_pd, 1024, _TRUNCATE, L"%s\\BiFlow\\bypass_apps.txt",
                  prog);
     _snwprintf_s(g_path_status, 1024, _TRUNCATE,
-                 L"%s\\BiFlow\\hook_status_%lu.txt", prog, (unsigned long)pid);
+                 L"%s\\BiFlow\\status\\hook_status_%lu.txt", prog,
+                 (unsigned long)pid);
   }
   if (g_path_status[0] == L'\0' && GetTempPathW(1024, tmp) > 0) {
     _snwprintf_s(g_path_status, 1024, _TRUNCATE,
@@ -423,10 +429,34 @@ static int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF lpBuffers,
 // Report hook installation status so BiFlow's UI can be honest about whether
 // the bypass is really live. Content: "OK <n>" or "ERR <stage>".
 static void write_status_file(const char *status) {
-  if (g_path_status[0] == L'\0')
+  HANDLE h;
+  if (g_path_status[0] != L'\0') {
+    h = CreateFileW(g_path_status, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+      DWORD written = 0;
+      WriteFile(h, status, (DWORD)strlen(status), &written, NULL);
+      CloseHandle(h);
+      return;
+    }
+  }
+  // Fallback: %TEMP%\BiFlow. The status folder is ACL'd for user writes,
+  // but if it could not be prepared (or ProgramData is unavailable) the
+  // report still has to land somewhere the elevated reader checks — and
+  // it does check this location. A report is not policy, so TEMP is safe
+  // for it; BiFlow deletes any stale report for the PID before injecting,
+  // so a leftover file here cannot fake a fresh result either.
+  wchar_t tmp[1024];
+  if (GetTempPathW(1024, tmp) == 0)
     return;
-  HANDLE h = CreateFileW(g_path_status, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  wchar_t dir[1100];
+  _snwprintf_s(dir, 1100, _TRUNCATE, L"%sBiFlow", tmp);
+  CreateDirectoryW(dir, NULL);
+  wchar_t path[1200];
+  _snwprintf_s(path, 1200, _TRUNCATE, L"%s\\hook_status_%lu.txt", dir,
+               (unsigned long)GetCurrentProcessId());
+  h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                  FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE)
     return;
   DWORD written = 0;
