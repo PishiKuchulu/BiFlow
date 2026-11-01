@@ -90,6 +90,31 @@ jobs:
             SHA256SUMS.txt
           retention-days: 14
 
+  msrv:
+    name: MSRV check (Rust 1.90)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust 1.90 toolchain
+        uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The declared rust-version must actually build: the locked
+      # dependencies (tray-icon 0.26.0) require Rust 1.90 even though the
+      # manifest once claimed 1.74.
+      - name: Check with the declared minimum toolchain
+        run: cargo check --locked
+
   release:
     name: Publish GitHub Release
     needs: build
