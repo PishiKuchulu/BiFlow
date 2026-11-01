@@ -1,8 +1,8 @@
 [package]
 name = "biflow"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.90"
 license = "MIT"
 description = "BiFlow - Portable Windows Per-App Split Routing Tool"
 default-run = "biflow"
@@ -25,6 +25,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
