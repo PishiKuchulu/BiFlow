@@ -4,6 +4,42 @@ pub mod injector;
 pub mod privilege;
 pub mod tray;
 
+/// Absolute path of a Windows system tool (`netsh.exe`, `schtasks.exe`, ...)
+/// inside the System32 directory, resolved via GetSystemDirectoryW.
+///
+/// An elevated process must never launch system tools by bare name:
+/// CreateProcessW searches the directory of the current executable BEFORE
+/// System32, so a same-named file planted next to a portable BiFlow.exe
+/// would be executed with BiFlow's administrator token.
+pub fn system_tool(file_name: &str) -> std::path::PathBuf {
+    system32_dir().join(file_name)
+}
+
+/// Absolute path of Windows PowerShell 5.1
+/// (System32\WindowsPowerShell\v1.0\powershell.exe).
+pub fn system_powershell() -> std::path::PathBuf {
+    system32_dir()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+fn system32_dir() -> std::path::PathBuf {
+    unsafe {
+        let mut buf = vec![0u16; 32768];
+        let n = windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        );
+        if n > 0 && (n as usize) < buf.len() {
+            return std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
+        }
+    }
+    // Fallback: %SystemRoot%\System32 (SystemRoot is set by Windows itself).
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    std::path::PathBuf::from(root).join("System32")
+}
+
 #[cfg(windows)]
 pub fn get_main_window_hwnd() -> windows_sys::Win32::Foundation::HWND {
     struct SearchData {
