@@ -60,6 +60,11 @@ pub struct WatchdogSnapshot {
 /// which PIDs still need injection.
 pub struct WatchdogPlanEntry {
     pub app_id: Uuid,
+    /// The entry's injected-PID map as the plan saw it. Commit compares
+    /// the live entry against this: if they differ, a UI operation
+    /// changed the entry while the watchdog was injecting, and the
+    /// plan's bookkeeping must not overwrite the newer live state.
+    pub base_injected: HashMap<u32, u64>,
     pub pruned_injected: HashMap<u32, u64>,
     pub had_pids: bool,
     pub to_inject: Vec<u32>,
@@ -155,21 +160,22 @@ impl EnforcementManager {
             );
         }
 
-        let dll_path = injector::ensure_dll_extracted()?;
-        let prev_ip = self.target_ip.clone();
-        self.target_ip = Some(source_ip);
-
+        // Validate BEFORE mutating any state: an empty exe name used to
+        // insert a permanently-Failed entry whose path still landed on
+        // the published allow-list, and an earlier revision of this check
+        // ran after target_ip had already been overwritten — the error
+        // path then left the manager pointing at an IP no entry used.
         let exe_name = exe
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
-
-        // An empty exe name used to insert a permanently-Failed entry
-        // whose path still landed on the published allow-list. Refuse
-        // before mutating any state instead.
         if exe_name.is_empty() {
             return Err("Executable path has no file name".into());
         }
+
+        let dll_path = injector::ensure_dll_extracted()?;
+        let prev_ip = self.target_ip.clone();
+        self.target_ip = Some(source_ip);
         self.adapter_missing_cycles = 0;
 
         let mut injected_pids: HashMap<u32, u64> = HashMap::new();
@@ -538,6 +544,7 @@ impl EnforcementManager {
                 .collect();
             out.push(WatchdogPlanEntry {
                 app_id: bypass.app_id,
+                base_injected: bypass.injected_pids.clone(),
                 pruned_injected: pruned,
                 had_pids: !current.is_empty(),
                 to_inject,
@@ -588,21 +595,27 @@ impl EnforcementManager {
                     // discarded silently while the entries were marked
                     // Failed anyway — the hooks kept binding to the stale
                     // address behind a UI that said "suspended". On
-                    // failure: log it and keep the bookkeeping truthful
-                    // (injected PIDs stay recorded); the branch re-enters
-                    // next cycle and retries the deletion.
-                    if let Err(e) = self.sync_policy_files() {
-                        config::append_log(&format!("ADAPTER_LOST_POLICY_DELETE_FAILED {}", e));
-                        return;
+                    // failure: log it, do NOT mark the entries suspended,
+                    // and fall through so this cycle's real injections
+                    // (the plan below) are still recorded — discarding
+                    // them made the next cycles re-inject PIDs that were
+                    // already hooked. The branch re-enters next cycle
+                    // and retries the deletion.
+                    match self.sync_policy_files() {
+                        Ok(()) => {
+                            config::append_log("ADAPTER_LOST policy fail-closed");
+                            for bypass in self.active.values_mut() {
+                                bypass.injected_pids.clear();
+                                bypass.awaiting_process = false;
+                                bypass.inject_error =
+                                    Some("Direct adapter unavailable; bypass suspended".into());
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            config::append_log(&format!("ADAPTER_LOST_POLICY_DELETE_FAILED {}", e));
+                        }
                     }
-                    config::append_log("ADAPTER_LOST policy fail-closed");
-                    for bypass in self.active.values_mut() {
-                        bypass.injected_pids.clear();
-                        bypass.awaiting_process = false;
-                        bypass.inject_error =
-                            Some("Direct adapter unavailable; bypass suspended".into());
-                    }
-                    return;
                 }
             }
         }
@@ -611,6 +624,21 @@ impl EnforcementManager {
             let Some(bypass) = self.active.get_mut(&entry.app_id) else {
                 continue;
             };
+            // Race guard: the plan was computed from a snapshot taken
+            // before this cycle's (seconds-long) injection phase. If a
+            // UI operation changed this entry's bookkeeping in that
+            // window (remove + re-apply is the common case), the live
+            // entry is NEWER than the plan — overwriting it with the
+            // snapshot's pruned set would resurrect stale state and
+            // flicker the entry to Failed until the next cycle. Skip
+            // the entry; the next cycle re-plans from a fresh snapshot.
+            if bypass.injected_pids != entry.base_injected {
+                config::append_log(&format!(
+                    "WATCHDOG_COMMIT_RACE_SKIPPED app={}",
+                    entry.app_id
+                ));
+                continue;
+            }
             let mut injected_pids = entry.pruned_injected;
             if let Some(new) = injected.get(&entry.app_id) {
                 for (pid, created) in new {
@@ -718,5 +746,90 @@ mod tests {
         let b = m.active.get_mut(&id).unwrap();
         b.injected_pids.insert(1234, 42);
         assert_eq!(m.live_status(id), Some(BypassLiveStatus::Live));
+    }
+
+    fn entry(id: Uuid, injected: &[(u32, u64)]) -> ActiveBypass {
+        ActiveBypass {
+            app_id: id,
+            exe_path: PathBuf::from("C:\\a.exe"),
+            exe_name: "a.exe".into(),
+            injected_pids: injected.iter().copied().collect(),
+            helper_paths: HashSet::new(),
+            awaiting_process: false,
+            inject_error: None,
+        }
+    }
+
+    #[test]
+    fn apply_refuses_empty_exe_name_before_mutating_state() {
+        // Round-2 regression: the empty-name refusal in apply() used to
+        // run AFTER target_ip was overwritten, and the error path left
+        // the manager pointing at an IP nothing used. The check now runs
+        // before any mutation (and before DLL extraction), so the error
+        // must surface with the manager untouched.
+        let mut m = EnforcementManager::default();
+        let direct = crate::models::InterfaceInfo {
+            name: "Ethernet".into(),
+            index: 1,
+            adapter_id: "{TEST}".into(),
+            status: "Up".into(),
+            description: "test".into(),
+            ipv4: Some("192.168.1.10".into()),
+            gateway: None,
+            virtual_adapter: false,
+        };
+        // "C:\\" has no file_name component.
+        let err = m
+            .apply(Uuid::new_v4(), PathBuf::from("C:\\"), &direct)
+            .unwrap_err();
+        assert!(err.contains("no file name"), "unexpected error: {}", err);
+        assert!(m.active.is_empty());
+        assert!(m.target_ip.is_none());
+    }
+
+    #[test]
+    fn watchdog_commit_skips_entries_raced_by_the_ui() {
+        // Round-2 race: the plan is computed from a snapshot taken
+        // before the (seconds-long) injection phase. If the UI changed
+        // the entry in that window, commit must not overwrite the newer
+        // live bookkeeping with the snapshot's pruned set.
+        let mut m = EnforcementManager::default();
+        let id = Uuid::new_v4();
+        m.active.insert(id, entry(id, &[(111, 42)]));
+        // Plan was made when the entry had NO injections (base differs).
+        let plan = vec![WatchdogPlanEntry {
+            app_id: id,
+            base_injected: HashMap::new(),
+            pruned_injected: HashMap::new(),
+            had_pids: true,
+            to_inject: vec![],
+            helper_paths: vec!["C:\\helper.exe".into()],
+        }];
+        m.watchdog_commit(plan, &HashMap::new(), &HashMap::new(), Some("192.168.1.10"));
+        let b = &m.active[&id];
+        assert_eq!(b.injected_pids.len(), 1);
+        assert!(b.injected_pids.contains_key(&111));
+        assert!(b.helper_paths.is_empty());
+    }
+
+    #[test]
+    fn watchdog_commit_applies_plan_when_not_raced() {
+        let mut m = EnforcementManager::default();
+        let id = Uuid::new_v4();
+        m.active.insert(id, entry(id, &[(111, 42)]));
+        let plan = vec![WatchdogPlanEntry {
+            app_id: id,
+            base_injected: [(111, 42)].into_iter().collect(),
+            pruned_injected: [(111, 42)].into_iter().collect(),
+            had_pids: true,
+            to_inject: vec![222],
+            helper_paths: vec![],
+        }];
+        let mut injected = HashMap::new();
+        injected.insert(id, vec![(222, 7)]);
+        m.watchdog_commit(plan, &injected, &HashMap::new(), Some("192.168.1.10"));
+        let b = &m.active[&id];
+        assert_eq!(b.injected_pids.len(), 2);
+        assert_eq!(b.injected_pids.get(&222), Some(&7));
     }
 }
