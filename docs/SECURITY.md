@@ -66,6 +66,19 @@ no network connections of its own.
   impossible. A status report is advisory only — a same-user process
   could in principle plant one — so BiFlow deletes any stale report for a
   PID before injecting and never treats a report as policy.
+- The configuration file and the diagnostic log live in the user's own data
+  folder (`%LOCALAPPDATA%\BiFlow`, or `data\` next to the executable for a
+  portable copy) WITHOUT an ACL boundary: any process running as the same
+  user can read or edit them. The log therefore contains no secrets (it does
+  contain executable paths, local IPs and PIDs — treat it like any diagnostic
+  file before sharing it). Because the config is same-user-writable input,
+  the loader validates it: rules must reference absolute executable paths,
+  duplicate rules are merged, and a corrupt or newer-version config is
+  preserved as a `.corrupt` copy with saving disabled rather than silently
+  reset. Since v0.3.3 the autostart gate also verifies the executable
+  directory's real DACL (not just its path prefix) before registering the
+  elevated logon task, and the task's principal is the current user's SID
+  taken from the process token.
 - BiFlow only ever injects into processes of apps **you** chose. Anyone with
   Administrator rights on the machine can already do all of this without BiFlow.
 - Chromium-based browsers launched via "Launch Direct" run with
