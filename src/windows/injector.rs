@@ -193,7 +193,7 @@ fn apply_acl_sddl(path: &Path, sddl_str: &str, users_mask: u32) -> Result<(), St
             ));
         }
         let owner_ok = sid_to_string(actual_owner).as_deref() == Some("S-1-5-32-544");
-        let dacl_ok = verify_expected_dacl(actual_dacl, users_mask);
+        let dacl_ok = verify_expected_dacl(actual_dacl, users_mask, path.is_dir());
         LocalFree(read_sd as HLOCAL);
         if !owner_ok {
             return Err(format!(
@@ -214,13 +214,18 @@ fn apply_acl_sddl(path: &Path, sddl_str: &str, users_mask: u32) -> Result<(), St
 /// Returns Some(true) when the DACL of `path` grants write-like rights
 /// (write data / append / delete / write DAC / generic write or all) to
 /// any untrusted principal: Users, Authenticated Users, Everyone,
-/// CREATOR OWNER, or the current user personally. None when the DACL
-/// cannot be read (callers must fail closed). Used by the autostart gate,
-/// where a lexical path-prefix test is NOT enough: a user-created
-/// subfolder of %ProgramData% passes a prefix test while being fully
-/// writable by its creator.
+/// CREATOR OWNER, or the current user personally — OR when the object's
+/// OWNER is such a principal: an owner implicitly holds WRITE_DAC, so a
+/// user-owned folder with a hand-crafted clean DACL is still fully
+/// controllable by that user (round-2 audit: the DACL-only check had
+/// exactly this blind spot). None when the security info cannot be
+/// read (callers must fail closed). Used by the autostart gate, where a
+/// lexical path-prefix test is NOT enough: a user-created subfolder of
+/// %ProgramData% passes a prefix test while being fully writable by
+/// its creator.
 pub(crate) fn path_grants_untrusted_write(path: &Path, current_user_sid: &str) -> Option<bool> {
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
     const DANGEROUS_MASK: u32 = 0x4000_0000  // GENERIC_WRITE
         | 0x1000_0000  // GENERIC_ALL
         | 0x0200_0000  // MAXIMUM_ALLOWED
@@ -244,12 +249,13 @@ pub(crate) fn path_grants_untrusted_write(path: &Path, current_user_sid: &str) -
             .chain(std::iter::once(0))
             .collect();
         let mut dacl: *mut ACL = null_mut();
+        let mut owner: PSID = null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
         let err = GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &mut owner,
             null_mut(),
             &mut dacl,
             null_mut(),
@@ -260,6 +266,16 @@ pub(crate) fn path_grants_untrusted_write(path: &Path, current_user_sid: &str) -
                 LocalFree(sd as HLOCAL);
             }
             return None;
+        }
+        // Owner check: an untrusted owner can rewrite the DACL at will,
+        // whatever the ACEs currently say.
+        if !owner.is_null() {
+            if let Some(owner_sid) = sid_to_string(owner) {
+                if untrusted.contains(&owner_sid.as_str()) {
+                    LocalFree(sd as HLOCAL);
+                    return Some(true);
+                }
+            }
         }
         use windows_sys::Win32::Security::{
             AclSizeInformation, GetAce, GetAclInformation, ACL_SIZE_INFORMATION,
@@ -325,9 +341,13 @@ unsafe fn sid_to_string(sid: PSID) -> Option<String> {
 
 /// Verifies a read-back DACL contains EXACTLY the expected ACEs: SYSTEM
 /// and Administrators with FILE_ALL_ACCESS (0x001F01FF), Users with
-/// `users_mask`, every ACE an access-allowed ACE carrying OI|CI
-/// inheritance, and nothing else (no extra allow ACEs, no deny ACEs).
-unsafe fn verify_expected_dacl(dacl: *mut ACL, users_mask: u32) -> bool {
+/// `users_mask`, every ACE an access-allowed ACE, and nothing else (no
+/// extra allow ACEs, no deny ACEs). OI|CI inheritance flags are required
+/// only for containers: on leaf files those flags are meaningless and
+/// Windows may normalize them away, so demanding them there could fail
+/// every verification on real systems (round-2 audit, INFERENCE item —
+/// the flags are now ignored for non-containers).
+unsafe fn verify_expected_dacl(dacl: *mut ACL, users_mask: u32, is_container: bool) -> bool {
     use windows_sys::Win32::Security::{
         AclSizeInformation, GetAce, GetAclInformation, ACL_SIZE_INFORMATION,
     };
@@ -364,7 +384,10 @@ unsafe fn verify_expected_dacl(dacl: *mut ACL, users_mask: u32) -> bool {
         let ace_type = *ace_bytes;
         let ace_flags = *ace_bytes.add(1);
         let mask = std::ptr::read_unaligned(ace_bytes.add(4) as *const u32);
-        if ace_type != ACE_TYPE_ACCESS_ALLOWED || (ace_flags & ACE_FLAGS_OI_CI) != ACE_FLAGS_OI_CI {
+        if ace_type != ACE_TYPE_ACCESS_ALLOWED {
+            return false;
+        }
+        if is_container && (ace_flags & ACE_FLAGS_OI_CI) != ACE_FLAGS_OI_CI {
             return false;
         }
         let sid = ace_bytes.add(8) as PSID;
@@ -571,7 +594,15 @@ fn hook_status_dirs() -> Vec<PathBuf> {
         dirs.push(base.join("status"));
         dirs.push(base);
     }
-    dirs.push(std::env::temp_dir().join("BiFlow"));
+    // The TEMP fallback is consulted ONLY when no ProgramData location
+    // exists. TEMP is writable by every same-user process: while the
+    // protected status directory exists, a report planted in TEMP
+    // ("OK 5") could otherwise fake a Live status for an injection that
+    // never hooked anything (round-2 audit).
+    let pd_exists = dirs.iter().any(|d| d.exists());
+    if !pd_exists {
+        dirs.push(std::env::temp_dir().join("BiFlow"));
+    }
     dirs
 }
 
