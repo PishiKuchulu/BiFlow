@@ -58,10 +58,17 @@ unsafe fn query_udp_table(af: u32, class: UDP_TABLE_CLASS) -> Option<Vec<u64>> {
 /// traffic meter: an ESTABLISHED connection may be idle and a UDP
 /// endpoint may only be bound, so the UI wording says "open connections",
 /// never "active traffic". LISTEN sockets do not count.
-pub fn get_active_network_pids() -> HashSet<u32> {
+///
+/// Returns None when ALL FOUR table queries failed: "enumeration is
+/// unavailable" must stay distinguishable from "no PID has a connection",
+/// because callers refresh a cached set from this and an unreadable table
+/// must not make every online app flicker to offline.
+pub fn get_active_network_pids() -> Option<HashSet<u32>> {
     let mut pids = HashSet::new();
+    let mut any_query_ok = false;
     unsafe {
         if let Some(buf) = query_tcp_table(AF_INET as u32, TCP_TABLE_OWNER_PID_ALL) {
+            any_query_ok = true;
             let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
             let num_entries = (*table).dwNumEntries;
             let rows = std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize);
@@ -73,6 +80,7 @@ pub fn get_active_network_pids() -> HashSet<u32> {
         }
 
         if let Some(buf) = query_tcp_table(AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL) {
+            any_query_ok = true;
             let table = buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
             let num_entries = (*table).dwNumEntries;
             let rows = std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize);
@@ -84,6 +92,7 @@ pub fn get_active_network_pids() -> HashSet<u32> {
         }
 
         if let Some(buf) = query_udp_table(AF_INET as u32, UDP_TABLE_OWNER_PID) {
+            any_query_ok = true;
             let table = buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
             let num_entries = (*table).dwNumEntries;
             let rows = std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize);
@@ -95,6 +104,7 @@ pub fn get_active_network_pids() -> HashSet<u32> {
         }
 
         if let Some(buf) = query_udp_table(AF_INET6 as u32, UDP_TABLE_OWNER_PID) {
+            any_query_ok = true;
             let table = buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID;
             let num_entries = (*table).dwNumEntries;
             let rows = std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize);
@@ -105,7 +115,11 @@ pub fn get_active_network_pids() -> HashSet<u32> {
             }
         }
     }
-    pids
+    if any_query_ok {
+        Some(pids)
+    } else {
+        None
+    }
 }
 
 /// Terminates existing IPv4 TCP connections owned by the given PIDs
@@ -113,10 +127,15 @@ pub fn get_active_network_pids() -> HashSet<u32> {
 /// this way — SetTcpEntry only accepts the IPv4 MIB_TCPROW layout (the old
 /// code cast a MIB_TCP6ROW to it, which never worked) — so IPv6 is covered
 /// by the firewall rule for new connections, not by teardown.
-pub fn terminate_tcp_connections_for_pids(target_pids: &HashSet<u32>) {
+/// Returns (terminated, failed) counts: the caller (firewall block)
+/// logs them, because "block succeeded" used to imply connections were
+/// cut even when every SetTcpEntry call had failed.
+pub fn terminate_tcp_connections_for_pids(target_pids: &HashSet<u32>) -> (usize, usize) {
     if target_pids.is_empty() {
-        return;
+        return (0, 0);
     }
+    let mut terminated = 0usize;
+    let mut failed = 0usize;
     unsafe {
         if let Some(buf) = query_tcp_table(AF_INET as u32, TCP_TABLE_OWNER_PID_ALL) {
             let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
@@ -130,11 +149,16 @@ pub fn terminate_tcp_connections_for_pids(target_pids: &HashSet<u32>) {
                     tcp_row.dwLocalPort = row.dwLocalPort;
                     tcp_row.dwRemoteAddr = row.dwRemoteAddr;
                     tcp_row.dwRemotePort = row.dwRemotePort;
-                    let _ = SetTcpEntry(&tcp_row);
+                    if SetTcpEntry(&tcp_row) == 0 {
+                        terminated += 1;
+                    } else {
+                        failed += 1;
+                    }
                 }
             }
         }
     }
+    (terminated, failed)
 }
 
 pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
@@ -152,8 +176,11 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
         )
     };
 
-    if ret == 111 {
-        // ERROR_BUFFER_OVERFLOW
+    // ERROR_BUFFER_OVERFLOW: the required size hint can grow between
+    // calls (an adapter appearing mid-enumeration), so retry a bounded
+    // number of times instead of giving up after a single resize.
+    let mut attempts = 0;
+    while ret == 111 && attempts < 3 {
         buf.resize(buf_len as usize, 0);
         ret = unsafe {
             GetAdaptersAddresses(
@@ -164,6 +191,7 @@ pub fn interfaces() -> Result<Vec<InterfaceInfo>, String> {
                 &mut buf_len,
             )
         };
+        attempts += 1;
     }
 
     if ret != 0 {
