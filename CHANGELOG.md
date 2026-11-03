@@ -1,5 +1,115 @@
 # Changelog
 
+## v0.3.4 — 2026-11-03
+
+Fix wave from the round-2 granular audit of v0.3.3 (48 new findings:
+0 Critical / 2 High / 18 Medium / 27 Low / 1 Info). The audit also
+re-verified every v0.3.3 fix claim: 33 of 37 fully verified, none
+missing or fake — the three caveats were defects in the v0.3.3 fix wave
+itself, and all three are fixed here.
+
+Correctness (engine):
+- A transient adapter-enumeration failure during a manual Refresh
+  could empty the adapter list and make the watchdog suspend every
+  bypass after two cycles. refresh() is now fail-soft like the other
+  two adapter consumers: on error/empty it keeps the previous list
+  and logs the failure.
+- apply()'s empty-exe-name refusal ran after target_ip had already
+  been overwritten and the error path did not restore it; validation
+  now runs before any state mutation (launch() already did), with a
+  regression test.
+- Watchdog commit could overwrite fresher UI bookkeeping: the plan
+  now carries the snapshot's injected-PID map, and commit skips any
+  entry whose live map changed during the injection window (logged
+  as WATCHDOG_COMMIT_RACE_SKIPPED), with tests.
+- When the adapter-loss policy deletion fails, commit no longer
+  discards the cycle's real injections (which caused re-injection
+  attempts into already-hooked processes every cycle); it records
+  them and retries the deletion next cycle.
+- Profile-apply retry is per-rule: previously one successful rule
+  stopped all retries, leaving startup-failed rules dead while the
+  profile looked active. Only rules with no entry or a Failed entry
+  are retried; satisfied rules are not re-applied.
+- The per-app status cache no longer rescans all processes per app
+  or allocates a fresh lowercase string per (network PID × app):
+  paths are lowercased once per refresh and indexed by path.
+
+UI honesty and interaction:
+- Custom-app removal is now confirmed and fully wired: it stops the
+  live bypass, removes the app's rules from every profile, lifts its
+  firewall block, and reports what was cleaned. (Previously: one
+  click, no confirmation, and all three were orphaned.)
+- The confirmation dialog is a real modal (egui::Modal backdrop
+  consumes background input; tray actions are not consumed while it
+  is open) and has a keyboard contract: Enter confirms, Esc cancels.
+- Success banners are built from the operations' actual results
+  (profile switch/save/revert, rule remove/toggle, rename, duplicate):
+  a partial or failed operation no longer gets an unconditional ✔.
+  save_current_bypasses_to_active_profile also reports save failures
+  it previously swallowed silently.
+- Busy feedback: heavy row operations (toggle, block, launch) and
+  Refresh run through a one-frame-deferred pattern — the click arms
+  the operation, a "Working…" spinner frame is presented, then the
+  operation executes. (The full async refactor remains deferred, see
+  below; the window still blocks during execution itself.)
+- Profile name uniqueness is enforced on rename and duplicate too
+  (duplicates auto-suffix "(Copy 2)", …); a refused rename keeps the
+  editor open with the attempted name. The rename field accepts
+  Enter/Esc like the create field.
+- The "BYPASS CONFIGURED" pill renders amber in both of its states
+  (the not-in-live-map arm was slate gray — an undocumented third
+  state). Helper-process widening gets a visible line under the row,
+  not only hover text; every Failed row shows a reason line (generic
+  fallback inline); selected app rows are outlined, not just marked
+  with a glyph; the stats row and the Apps toolbar wrap instead of
+  clipping at the minimum window width; empty states distinguish
+  "catalog empty" from "no filter match", and the Network tab has an
+  empty state; orphaned blocked entries are labelled "Unknown app
+  (leftover entry)" instead of a bare UUID; tray menu items enable/
+  disable with engine state; autostart strings say "logon", not
+  "boot"; "Save Preferences" is now "Save All Settings", and the
+  Modified indicator explains itself on hover.
+
+Security:
+- The autostart protected-location gate now also reads the object's
+  OWNER: an untrusted owner implicitly holds WRITE_DAC, so a
+  user-owned folder with a hand-crafted clean DACL no longer passes.
+- Hook-status reports in %TEMP% are ignored while the protected
+  ProgramData status directory exists (a planted "OK 5" there could
+  fake a Live status).
+- set_autostart re-proves the ProgramData folder ACL before writing
+  the task XML, like policy publishing does.
+- ACL verification no longer demands OI|CI inheritance flags on leaf
+  files (directories still require them): the flags are meaningless
+  on files and Windows may normalize them, which would have failed
+  every verification (this was an INFERENCE risk in the audit).
+- The hook's policy fingerprint now includes a content hash, so a
+  same-size policy rewrite inside one FILETIME tick (e.g. a swapped
+  target IP) is detected; ProgramData/TEMP path lengths from the
+  environment APIs are bound-checked before use.
+- block_app's verification-failure path now attempts the same
+  verified cleanup as the partial-success path instead of leaving
+  possibly-created rules behind a "failed" report.
+- The hook DLL is built with Control Flow Guard (/guard:cf +
+  /GUARD:CF) explicitly.
+- CI: third-party actions are pinned to API-verified commit SHAs
+  (dtolnay/rust-toolchain excepted — its ref selects the toolchain),
+  and a non-blocking cargo-audit job runs on every push.
+- Vendored MinHook is now documented in cpp/minhook/VENDORED.md, and
+  docs/ARCHITECTURE.md's stale "two locations" allow-list claim is
+  corrected (policy lives only in %ProgramData%\BiFlow).
+
+Still deferred (unchanged honesty notes):
+- Moving blocking engine work fully off the UI thread (the busy
+  pattern above mitigates feedback, not the block itself) and the
+  manager-mutex hold during UI-initiated injection — one
+  architectural item, to be validated on a real Windows device.
+- Trust roots still read ProgramData/ProgramFiles from the process
+  environment (fail-closed in the common cases); switching to
+  SHGetKnownFolderPath is planned with the same device validation.
+- Whole-card click-to-select and text-size/target enlargements wait
+  for the screenshot QA pass listed in the audit's release checklist.
+
 ## v0.3.3 — 2026-11-03
 
 Fix wave from the internal granular four-layer audit of v0.3.2
