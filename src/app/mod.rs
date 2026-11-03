@@ -1,6 +1,6 @@
 use crate::{
     config, discovery,
-    enforcement::EnforcementManager,
+    enforcement::{BypassLiveStatus, EnforcementManager},
     models::*,
     network,
     windows::{autostart, injector},
@@ -42,6 +42,11 @@ pub struct AppState {
     /// UI thread every 1.5 s (the old tick froze the window on a loaded
     /// machine).
     pub watchdog_cache: Arc<Mutex<Option<WatchdogCache>>>,
+    /// Heartbeat of the watchdog thread, updated at the top of every
+    /// cycle. tick_watchdog respawns the thread when this goes stale:
+    /// a panic in the cycle used to kill enforcement silently while
+    /// the UI kept rendering a normal-looking state.
+    pub watchdog_beat: Arc<Mutex<Instant>>,
     /// True when the config file existed but could not be read at startup;
     /// saving is then disabled so defaults never overwrite the real config.
     pub config_load_failed: bool,
@@ -202,6 +207,7 @@ impl AppState {
             manager: Arc::new(Mutex::new(EnforcementManager::default())),
             watchdog_adapter: Arc::new(Mutex::new(selected_direct_if)),
             watchdog_cache: Arc::new(Mutex::new(None)),
+            watchdog_beat: Arc::new(Mutex::new(Instant::now())),
             config_load_failed,
             bypass_paused: false,
             app_status: HashMap::new(),
@@ -285,7 +291,7 @@ impl AppState {
         }
 
         // Apply rules from active profile if any
-        state.apply_active_profile_rules();
+        state.apply_rules_and_log("startup");
 
         // Record baseline rules snapshot for active profile
         if let Some(active_pid) = state.store.active_profile {
@@ -367,82 +373,105 @@ impl AppState {
         let manager = self.manager.clone();
         let adapter = self.watchdog_adapter.clone();
         let cache = self.watchdog_cache.clone();
+        let beat = self.watchdog_beat.clone();
         let _ = std::thread::Builder::new()
             .name("biflow-watchdog".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                let maps = injector::get_process_maps();
-                let ifaces = network::interfaces().unwrap_or_default();
-                // Publish this cycle's snapshot for the UI tick, which no
-                // longer pays for these enumerations on the UI thread.
-                if let Ok(mut slot) = cache.lock() {
-                    *slot = Some(WatchdogCache {
-                        process_parents: maps.0.clone(),
-                        pid_to_path: maps.1.clone(),
-                        active_network_pids: network::get_active_network_pids(),
-                        interfaces: ifaces.clone(),
-                    });
-                }
-                let idx = *adapter.lock().unwrap_or_else(|e| e.into_inner());
-                // APIPA is not a usable direct address: an adapter with
-                // only a link-local address counts as "no adapter", so the
-                // commit's fail-closed path applies instead of publishing
-                // a source IP that cannot route anywhere.
-                let ip = idx
-                    .and_then(|i| ifaces.iter().find(|x| x.index == i))
-                    .and_then(|i| i.ipv4.clone())
-                    .filter(|ip| !network::is_apipa_ipv4(ip));
-                let snapshot = {
-                    let mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
-                    mgr.watchdog_snapshot()
-                };
-                if snapshot.entries.is_empty() {
-                    continue;
-                }
-                let dll_path = match injector::ensure_dll_extracted() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
+            .spawn(move || {
+                // Last successfully enumerated adapter list, reused when
+                // an enumeration fails: two empty samples in a row used
+                // to read as "adapter lost" and trip the fail-close on a
+                // perfectly healthy adapter (round-2 completion audit).
+                let mut last_good_ifaces: Vec<InterfaceInfo> = Vec::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    if let Ok(mut b) = beat.lock() {
+                        *b = Instant::now();
+                    }
+                    let maps = injector::get_process_maps();
+                    let ifaces = match network::interfaces() {
+                        Ok(list) if !list.is_empty() => {
+                            last_good_ifaces = list.clone();
+                            list
+                        }
+                        _ => last_good_ifaces.clone(),
+                    };
+                    // Publish this cycle's snapshot for the UI tick, which no
+                    // longer pays for these enumerations on the UI thread.
+                    if let Ok(mut slot) = cache.lock() {
+                        *slot = Some(WatchdogCache {
+                            process_parents: maps.0.clone(),
+                            pid_to_path: maps.1.clone(),
+                            active_network_pids: network::get_active_network_pids(),
+                            interfaces: ifaces.clone(),
+                        });
+                    }
+                    let idx = *adapter.lock().unwrap_or_else(|e| e.into_inner());
+                    // APIPA is not a usable direct address: an adapter with
+                    // only a link-local address counts as "no adapter", so the
+                    // commit's fail-closed path applies instead of publishing
+                    // a source IP that cannot route anywhere.
+                    let ip = idx
+                        .and_then(|i| ifaces.iter().find(|x| x.index == i))
+                        .and_then(|i| i.ipv4.clone())
+                        .filter(|ip| !network::is_apipa_ipv4(ip));
+                    let snapshot = {
+                        let mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
+                        mgr.watchdog_snapshot()
+                    };
+                    if snapshot.entries.is_empty() {
                         continue;
                     }
-                };
-                let plan = EnforcementManager::watchdog_plan(&snapshot, &maps);
-                let mut injected: HashMap<Uuid, Vec<(u32, u64)>> = HashMap::new();
-                let mut errors: HashMap<Uuid, String> = HashMap::new();
-                for entry in &plan {
-                    for &pid in &entry.to_inject {
-                        match injector::inject_dll_into_pid(pid, &dll_path) {
-                            Ok(()) => {
-                                injected
-                                    .entry(entry.app_id)
-                                    .or_default()
-                                    .push((pid, injector::process_creation_time(pid).unwrap_or(0)));
-                            }
-                            Err(e) => {
-                                errors.insert(entry.app_id, e);
+                    let dll_path = match injector::ensure_dll_extracted() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
+                            continue;
+                        }
+                    };
+                    let plan = EnforcementManager::watchdog_plan(&snapshot, &maps);
+                    let mut injected: HashMap<Uuid, Vec<(u32, u64)>> = HashMap::new();
+                    let mut errors: HashMap<Uuid, String> = HashMap::new();
+                    for entry in &plan {
+                        for &pid in &entry.to_inject {
+                            match injector::inject_dll_into_pid(pid, &dll_path) {
+                                Ok(()) => {
+                                    injected.entry(entry.app_id).or_default().push((
+                                        pid,
+                                        injector::process_creation_time(pid).unwrap_or(0),
+                                    ));
+                                }
+                                Err(e) => {
+                                    errors.insert(entry.app_id, e);
+                                }
                             }
                         }
                     }
+                    // Re-resolve the adapter address immediately before the
+                    // commit: the plan/injection phase above can take seconds,
+                    // and if the user switched adapters meanwhile, committing
+                    // the address sampled at the top would publish the OLD
+                    // adapter's IP as the bypass source. The snapshot-phase
+                    // value is only a fallback if re-resolution fails outright.
+                    let ifaces_now = match network::interfaces() {
+                        Ok(list) if !list.is_empty() => {
+                            last_good_ifaces = list.clone();
+                            list
+                        }
+                        _ => ifaces.clone(),
+                    };
+                    let idx_now = *adapter.lock().unwrap_or_else(|e| e.into_inner());
+                    let fresh_ip = idx_now
+                        .and_then(|i| ifaces_now.iter().find(|x| x.index == i))
+                        .and_then(|i| i.ipv4.clone())
+                        .filter(|ip| !network::is_apipa_ipv4(ip));
+                    let commit_ip = if ifaces_now.is_empty() {
+                        ip.as_deref()
+                    } else {
+                        fresh_ip.as_deref()
+                    };
+                    let mut mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
+                    mgr.watchdog_commit(plan, &injected, &errors, commit_ip);
                 }
-                // Re-resolve the adapter address immediately before the
-                // commit: the plan/injection phase above can take seconds,
-                // and if the user switched adapters meanwhile, committing
-                // the address sampled at the top would publish the OLD
-                // adapter's IP as the bypass source. The snapshot-phase
-                // value is only a fallback if re-resolution fails outright.
-                let ifaces_now = network::interfaces().unwrap_or_default();
-                let idx_now = *adapter.lock().unwrap_or_else(|e| e.into_inner());
-                let fresh_ip = idx_now
-                    .and_then(|i| ifaces_now.iter().find(|x| x.index == i))
-                    .and_then(|i| i.ipv4.clone())
-                    .filter(|ip| !network::is_apipa_ipv4(ip));
-                let commit_ip = if ifaces_now.is_empty() {
-                    ip.as_deref()
-                } else {
-                    fresh_ip.as_deref()
-                };
-                let mut mgr = manager.lock().unwrap_or_else(|e| e.into_inner());
-                mgr.watchdog_commit(plan, &injected, &errors, commit_ip);
             });
     }
 
@@ -611,10 +640,58 @@ impl AppState {
     /// cache refresh. The UI reads this cache every frame instead of
     /// re-running the O(apps × processes) scans per frame.
     pub fn refresh_app_status_cache(&mut self) {
+        // One pass over the process table, shared by every app: the
+        // previous version rescanned all processes per app and allocated
+        // a fresh lowercase String per (network PID × app) pair — with a
+        // few hundred apps and processes that was hundreds of thousands
+        // of string operations on the UI thread every 1.5 s.
+        let lower_by_pid: HashMap<u32, String> = self
+            .pid_to_path
+            .iter()
+            .map(|(pid, p)| (*pid, p.to_ascii_lowercase()))
+            .collect();
+        let mut pids_by_path: HashMap<&str, Vec<u32>> = HashMap::new();
+        for (pid, lower) in &lower_by_pid {
+            pids_by_path.entry(lower.as_str()).or_default().push(*pid);
+        }
+        let net_pids = &self.active_network_pids;
         let mut cache = HashMap::with_capacity(self.apps.len());
         for app in &self.apps {
-            let running = self.is_app_running(app);
-            let net = running && self.has_active_network(app);
+            let exe_lower = app.executable.to_ascii_lowercase();
+            let own_pids: &[u32] = pids_by_path
+                .get(exe_lower.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let running = !own_pids.is_empty();
+            let mut net = false;
+            if running {
+                net = own_pids.iter().any(|p| net_pids.contains(p));
+                if !net {
+                    // Child of one of the app's own processes.
+                    let own_set: HashSet<u32> = own_pids.iter().copied().collect();
+                    net = net_pids.iter().any(|np| {
+                        self.process_parents
+                            .get(np)
+                            .map(|parent| own_set.contains(parent))
+                            .unwrap_or(false)
+                    });
+                }
+                if !net {
+                    // Same-directory binary (helpers in the app's folder).
+                    if let Some(app_dir) = Path::new(&app.executable).parent() {
+                        let app_dir_str = app_dir.to_string_lossy().to_ascii_lowercase();
+                        if app_dir_str.len() > 3 {
+                            let dir_prefix = format!("{}\\", app_dir_str.trim_end_matches('\\'));
+                            net = net_pids.iter().any(|np| {
+                                lower_by_pid
+                                    .get(np)
+                                    .map(|p| p.starts_with(&dir_prefix))
+                                    .unwrap_or(false)
+                            });
+                        }
+                    }
+                }
+            }
             cache.insert(app.id, (running, net));
         }
         self.app_status = cache;
@@ -628,59 +705,10 @@ impl AppState {
         self.app_status.get(&app.id).map(|s| s.1).unwrap_or(false)
     }
 
-    pub fn is_app_running(&self, app: &AppEntry) -> bool {
-        // Full executable path ONLY: a same-name binary in another folder
-        // must never make this app look running. (The basename-keyed
-        // process map is deliberately not consulted here.)
-        self.pid_to_path
-            .values()
-            .any(|p| p.eq_ignore_ascii_case(&app.executable))
-    }
-
-    pub fn has_active_network(&self, app: &AppEntry) -> bool {
-        // Exact-path PIDs of this app (no basename fallback: a same-name
-        // binary elsewhere must never make this app look online).
-        let own_pids: Vec<u32> = self
-            .pid_to_path
-            .iter()
-            .filter(|(_, p)| p.eq_ignore_ascii_case(&app.executable))
-            .map(|(pid, _)| *pid)
-            .collect();
-        if own_pids
-            .iter()
-            .any(|p| self.active_network_pids.contains(p))
-        {
-            return true;
-        }
-
-        // Child process match (e.g. Steam -> steamwebhelper, Discord -> DiscordHelper, Electron apps)
-        for net_pid in &self.active_network_pids {
-            if let Some(parent) = self.process_parents.get(net_pid) {
-                if own_pids.contains(parent) {
-                    return true;
-                }
-            }
-        }
-
-        // Same directory / Sub-directory binary match. The prefix must
-        // end at a path separator boundary: "C:\Program Files\Foo" must
-        // not match processes in "C:\Program Files\FooBar".
-        if let Some(app_dir) = Path::new(&app.executable).parent() {
-            let app_dir_str = app_dir.to_string_lossy().to_ascii_lowercase();
-            if app_dir_str.len() > 3 {
-                let dir_prefix = format!("{}\\", app_dir_str.trim_end_matches('\\'));
-                for net_pid in &self.active_network_pids {
-                    if let Some(p) = self.pid_to_path.get(net_pid) {
-                        if p.to_ascii_lowercase().starts_with(&dir_prefix) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
+    // is_app_running / has_active_network used to live here as
+    // per-app O(processes) scans; refresh_app_status_cache now computes
+    // both answers for every app in one shared pass, and nothing else
+    // called the per-app versions (round-2 performance finding).
 
     pub fn toggle_autostart(&mut self, enable: bool) -> Result<(), String> {
         match autostart::set_autostart(enable) {
@@ -690,9 +718,9 @@ impl AppState {
                 // startup, so a failed config save does not change the outcome.
                 let _ = self.save();
                 self.status = if enable {
-                    "BiFlow configured to start automatically with Windows.".into()
+                    "BiFlow configured to start automatically at Windows logon.".into()
                 } else {
-                    "BiFlow removed from Windows startup.".into()
+                    "BiFlow removed from Windows logon startup.".into()
                 };
                 Ok(())
             }
@@ -723,7 +751,23 @@ impl AppState {
             }
         }
         self.apps = discovered;
-        self.interfaces = network::interfaces().unwrap_or_default();
+        // Fail-soft, like the other two adapter consumers: a transient
+        // enumeration failure (or an empty result) must NOT replace the
+        // known adapter list. An empty list here used to cascade —
+        // resolve_adapter returned None, the watchdog saw "adapter
+        // missing", and after two cycles it suspended every bypass.
+        match network::interfaces() {
+            Ok(list) if !list.is_empty() => self.interfaces = list,
+            Ok(_) => {
+                config::append_log("ADAPTER_ENUM_EMPTY_ON_REFRESH kept previous list");
+            }
+            Err(e) => {
+                config::append_log(&format!(
+                    "ADAPTER_ENUM_FAILED_ON_REFRESH {} (kept previous list)",
+                    e
+                ));
+            }
+        }
         self.update_running_cache();
 
         // Preserve selected direct interface if still valid (GUID first)
@@ -790,12 +834,49 @@ impl AppState {
     /// forever and could only be removed by hand-editing the JSON. Only
     /// the custom entry is removed; if the same executable is also
     /// discovered normally it stays in the catalog as a discovered app.
-    pub fn remove_custom_app(&mut self, app_id: Uuid) {
-        let before = self.store.custom_apps.len();
-        self.store.custom_apps.retain(|a| a.id != app_id);
-        if self.store.custom_apps.len() == before {
-            return;
+    /// Full cleanup when a custom app is removed: the entry, its live
+    /// bypass, every profile rule that references it, and its firewall
+    /// block. The first version of this feature removed only the list
+    /// entry — a live bypass kept running with no controlling row, its
+    /// rules rendered as "Unknown App", and its block as a bare UUID.
+    pub fn remove_custom_app(&mut self, app_id: Uuid) -> Option<(usize, bool, bool)> {
+        let entry = self
+            .store
+            .custom_apps
+            .iter()
+            .find(|a| a.id == app_id)
+            .cloned()?;
+        // Stop the live bypass first (best-effort; a failure is logged
+        // and reported, the cleanup still proceeds).
+        let was_live = self.manager().is_active(app_id);
+        if was_live {
+            let remove_result = self.manager().remove(app_id);
+            if let Err(e) = remove_result {
+                config::append_log(&format!(
+                    "CUSTOM_APP_REMOVE_LIVE_STOP_FAILED app={} err={}",
+                    app_id, e
+                ));
+            }
         }
+        // Drop every profile rule referencing the app.
+        let mut rules_removed = 0usize;
+        for p in self.store.profiles.iter_mut() {
+            let before = p.rules.len();
+            p.rules.retain(|r| r.app_id != app_id);
+            rules_removed += before - p.rules.len();
+        }
+        // Drop the firewall block, if any (rules are keyed by app id).
+        let was_blocked = self.store.blocked_apps.contains(&app_id);
+        if was_blocked {
+            self.store.blocked_apps.retain(|id| *id != app_id);
+            if let Err(e) = crate::windows::firewall::unblock_app(&app_id) {
+                config::append_log(&format!(
+                    "CUSTOM_APP_REMOVE_UNBLOCK_FAILED app={} err={}",
+                    app_id, e
+                ));
+            }
+        }
+        self.store.custom_apps.retain(|a| a.id != app_id);
         self.apps
             .retain(|a| !(a.id == app_id && a.source == "Custom"));
         if self.selected_app == Some(app_id) {
@@ -803,7 +884,18 @@ impl AppState {
         }
         match self.save() {
             Ok(()) => {
-                self.status = "Custom application removed.".into();
+                if let Some(pid) = self.store.active_profile {
+                    if let Some(p) = self.store.profiles.iter().find(|p| p.id == pid) {
+                        self.active_profile_baseline = p.rules.clone();
+                    }
+                }
+                self.status = format!(
+                    "Custom application '{}' removed ({} profile rule(s), block: {}, live bypass stopped: {}).",
+                    entry.name,
+                    rules_removed,
+                    if was_blocked { "removed" } else { "none" },
+                    if was_live { "yes" } else { "no" }
+                );
             }
             Err(e) => {
                 self.status = format!(
@@ -813,6 +905,7 @@ impl AppState {
             }
         }
         self.refresh_app_status_cache();
+        Some((rules_removed, was_blocked, was_live))
     }
 
     pub fn is_app_blocked(&self, app_id: Uuid) -> bool {
@@ -983,7 +1076,7 @@ impl AppState {
             Ok(()) => String::new(),
             Err(e) => format!(" Existing bypasses could not be cleared: {}", e),
         };
-        let _ = self.apply_active_profile_rules();
+        self.apply_rules_and_log("adapter_select");
         self.recompute_paused();
         if let Some(iface) = self.interfaces.iter().find(|i| i.index == idx) {
             // Selecting an adapter with no usable IPv4 is legal (the
@@ -1023,21 +1116,23 @@ impl AppState {
         false
     }
 
-    pub fn revert_active_profile(&mut self) {
+    pub fn revert_active_profile(&mut self) -> Result<String, String> {
         let Some(pid) = self.store.active_profile else {
-            return;
+            self.status = "No active profile to revert.".into();
+            return Err(self.status.clone());
         };
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == pid) {
             p.rules = self.active_profile_baseline.clone();
         }
         let saved = self.save();
-        let clear_note = match self.manager().clear_all() {
+        let clear_result = self.manager().clear_all();
+        let clear_note = match &clear_result {
             Ok(()) => String::new(),
             Err(e) => format!(" Live bypasses could not be cleared: {}", e),
         };
-        let _ = self.apply_active_profile_rules();
+        self.apply_rules_and_log("revert");
         self.recompute_paused();
-        self.status = match saved {
+        self.status = match &saved {
             Ok(()) => format!(
                 "Reverted profile changes to last saved state.{}",
                 clear_note
@@ -1047,6 +1142,11 @@ impl AppState {
                 e, clear_note
             ),
         };
+        if saved.is_err() || clear_result.is_err() {
+            Err(self.status.clone())
+        } else {
+            Ok(self.status.clone())
+        }
     }
 
     pub fn toggle_bypass(&mut self) {
@@ -1271,7 +1371,7 @@ impl AppState {
         };
     }
 
-    pub fn switch_profile(&mut self, profile_id: Uuid) {
+    pub fn switch_profile(&mut self, profile_id: Uuid) -> Result<String, String> {
         // 1. Clear active live bypass enforcement in memory without
         // altering stored profile rules. A failed clear aborts the
         // switch: proceeding would stack the new profile's rules on top
@@ -1282,7 +1382,7 @@ impl AppState {
                 "Profile switch aborted: current bypasses could not be cleared ({})",
                 e
             );
-            return;
+            return Err(self.status.clone());
         }
 
         // 2. Set active profile. Switching to a profile is an explicit
@@ -1329,6 +1429,7 @@ impl AppState {
         // 4. Apply all enabled rules from the new active profile
         let (_applied, failed) = self.apply_active_profile_rules();
         self.recompute_paused();
+        let saved_ok = saved.is_ok();
 
         if let Some(p) = self.store.profiles.iter().find(|x| x.id == profile_id) {
             let active_count = p.rules.iter().filter(|r| r.enabled).count();
@@ -1347,6 +1448,14 @@ impl AppState {
                     p.name, active_count, fail_note, e
                 ),
             };
+        }
+        // The banner in the UI is built from this result: a switch that
+        // could not be saved, or whose rules partially failed, must not
+        // be reported as an unqualified success.
+        if !saved_ok || failed > 0 {
+            Err(self.status.clone())
+        } else {
+            Ok(self.status.clone())
         }
     }
 
@@ -1416,7 +1525,7 @@ impl AppState {
             Ok(()) => String::new(),
             Err(e) => format!(" Previous bypasses could not be cleared: {}", e),
         };
-        let _ = self.apply_active_profile_rules();
+        self.apply_rules_and_log("create_profile");
         self.recompute_paused();
 
         self.status = match saved {
@@ -1451,7 +1560,17 @@ impl AppState {
         if is_active {
             let next_id = self.store.profiles[0].id;
             let next_name = self.store.profiles[0].name.clone();
-            self.switch_profile(next_id);
+            // The deletion itself succeeded; a switch failure (clear
+            // aborted, save failed, rules failed) must not be reported
+            // as a clean delete + activation.
+            if let Err(e) = self.switch_profile(next_id) {
+                let msg = format!(
+                    "Profile '{}' deleted, but activating '{}' ran into a problem: {}",
+                    removed_name, next_name, e
+                );
+                self.status = msg.clone();
+                return Err(msg);
+            }
             let msg = format!(
                 "✔ Profile '{}' deleted. '{}' is now the active profile.",
                 removed_name, next_name
@@ -1481,7 +1600,15 @@ impl AppState {
             .find(|p| p.id == profile_id)?
             .clone();
         let new_id = Uuid::new_v4();
-        let new_name = format!("{} (Copy)", profile.name);
+        // Unique name: "{} (Copy)", then "{} (Copy 2)", ... — minting
+        // the same name twice recreated the ambiguity the create-path
+        // duplicate guard refuses.
+        let mut new_name = format!("{} (Copy)", profile.name);
+        let mut n = 2;
+        while self.profile_name_taken(&new_name, None) {
+            new_name = format!("{} (Copy {})", profile.name, n);
+            n += 1;
+        }
         let new_profile = Profile {
             id: new_id,
             name: new_name.clone(),
@@ -1501,23 +1628,44 @@ impl AppState {
         Some(new_id)
     }
 
-    pub fn rename_profile(&mut self, profile_id: Uuid, new_name: String) {
+    /// Shared name-uniqueness rule for profiles (create already checked
+    /// in the UI; rename and duplicate used to bypass it, recreating
+    /// the switcher ambiguity the create guard exists to prevent).
+    pub fn profile_name_taken(&self, name: &str, excluding: Option<Uuid>) -> bool {
+        self.store
+            .profiles
+            .iter()
+            .any(|p| Some(p.id) != excluding && p.name.eq_ignore_ascii_case(name.trim()))
+    }
+
+    pub fn rename_profile(&mut self, profile_id: Uuid, new_name: String) -> bool {
         let trimmed = new_name.trim();
         if trimmed.is_empty() {
-            return;
+            return false;
+        }
+        if self.profile_name_taken(trimmed, Some(profile_id)) {
+            self.status = format!(
+                "Rename refused: another profile is already named '{}'.",
+                trimmed
+            );
+            return false;
         }
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) {
             p.name = trimmed.to_string();
             if self.save().is_err() {
-                return;
+                self.status = "Profile renamed in memory, but it could not be saved.".into();
+                return false;
             }
             self.status = format!("Renamed profile to '{}'.", trimmed);
+            return true;
         }
+        false
     }
 
-    pub fn save_current_bypasses_to_active_profile(&mut self) {
+    pub fn save_current_bypasses_to_active_profile(&mut self) -> Result<String, String> {
         let Some(active_pid) = self.store.active_profile else {
-            return;
+            self.status = "No active profile to save into.".into();
+            return Err(self.status.clone());
         };
 
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == active_pid) {
@@ -1537,26 +1685,55 @@ impl AppState {
             let name = p.name.clone();
             let rules = p.rules.clone();
             // Baseline tracks the last PERSISTED rules: only move it when
-            // the save succeeds.
-            if self.save().is_ok() {
-                self.active_profile_baseline = rules;
-                self.status = format!(
-                    "Saved {} bypass rules into active profile '{}'.",
-                    count, name
-                );
+            // the save succeeds. A failed save used to be completely
+            // silent here — no status at all behind a ✔ banner.
+            match self.save() {
+                Ok(()) => {
+                    self.active_profile_baseline = rules;
+                    self.status = format!(
+                        "Saved {} bypass rules into active profile '{}'.",
+                        count, name
+                    );
+                    return Ok(self.status.clone());
+                }
+                Err(e) => {
+                    self.status = format!(
+                        "Could not save the current rules into profile '{}': {}",
+                        name, e
+                    );
+                    return Err(self.status.clone());
+                }
             }
         }
+        self.status = "Active profile not found.".into();
+        Err(self.status.clone())
     }
 
-    pub fn remove_rule_from_profile(&mut self, profile_id: Uuid, app_id: Uuid) {
+    pub fn remove_rule_from_profile(
+        &mut self,
+        profile_id: Uuid,
+        app_id: Uuid,
+    ) -> Result<String, String> {
+        let mut save_failed = false;
         if let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) {
             p.rules.retain(|r| r.app_id != app_id);
             let rules = p.rules.clone();
             // Keep the baseline honest for the active profile: a saved
             // removal must not leave "Modified" behind.
-            if self.save().is_ok() && self.store.active_profile == Some(profile_id) {
-                self.active_profile_baseline = rules;
+            match self.save() {
+                Ok(()) => {
+                    if self.store.active_profile == Some(profile_id) {
+                        self.active_profile_baseline = rules;
+                    }
+                }
+                Err(_) => save_failed = true,
             }
+        }
+        if save_failed {
+            self.status =
+                "Rule removed from the profile in memory, but the removal could not be saved."
+                    .into();
+            return Err(self.status.clone());
         }
         if self.store.active_profile == Some(profile_id) {
             let remove_result = self.manager().remove(app_id);
@@ -1565,8 +1742,11 @@ impl AppState {
                     "Rule removed from the profile, but the live bypass could not be stopped: {}",
                     e
                 );
+                return Err(self.status.clone());
             }
         }
+        self.status = "Rule removed from profile.".into();
+        Ok(self.status.clone())
     }
 
     /// Enables/disables one rule of a profile from the rules view (the
@@ -1574,12 +1754,19 @@ impl AppState {
     /// way to produce one was hand-editing the JSON — there was no UI
     /// control at all). For the active profile the live state follows:
     /// disabling stops the bypass, enabling applies it.
-    pub fn set_rule_enabled(&mut self, profile_id: Uuid, app_id: Uuid, enabled: bool) {
+    pub fn set_rule_enabled(
+        &mut self,
+        profile_id: Uuid,
+        app_id: Uuid,
+        enabled: bool,
+    ) -> Result<String, String> {
         let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) else {
-            return;
+            self.status = "Profile not found.".into();
+            return Err(self.status.clone());
         };
         let Some(rule) = p.rules.iter_mut().find(|r| r.app_id == app_id) else {
-            return;
+            self.status = "Rule not found in the profile.".into();
+            return Err(self.status.clone());
         };
         rule.enabled = enabled;
         let rule_exe = rule.exe_path.clone();
@@ -1589,13 +1776,30 @@ impl AppState {
             .iter()
             .find(|p| p.id == profile_id)
             .map(|p| p.rules.clone());
-        if self.save().is_ok() && self.store.active_profile == Some(profile_id) {
-            if let Some(rules) = rules_snapshot {
-                self.active_profile_baseline = rules;
+        match self.save() {
+            Ok(()) => {
+                if self.store.active_profile == Some(profile_id) {
+                    if let Some(rules) = rules_snapshot {
+                        self.active_profile_baseline = rules;
+                    }
+                }
+            }
+            Err(e) => {
+                self.status = format!(
+                    "Rule {} in the profile, but the change could not be saved: {}",
+                    if enabled { "enabled" } else { "disabled" },
+                    e
+                );
+                return Err(self.status.clone());
             }
         }
         if self.store.active_profile != Some(profile_id) {
-            return;
+            self.status = if enabled {
+                "Rule enabled.".into()
+            } else {
+                "Rule disabled.".into()
+            };
+            return Ok(self.status.clone());
         }
         if !enabled {
             let remove_result = self.manager().remove(app_id);
@@ -1604,6 +1808,7 @@ impl AppState {
                     "Rule disabled in the profile, but the live bypass could not be stopped: {}",
                     e
                 );
+                return Err(self.status.clone());
             }
         } else if let Some(direct) = self.direct_interface().cloned() {
             let target_exe = self
@@ -1617,10 +1822,17 @@ impl AppState {
                 if let Err(e) = apply_result {
                     self.status =
                         format!("Rule enabled, but the bypass could not be applied: {}", e);
+                    return Err(self.status.clone());
                 }
             }
             self.recompute_paused();
         }
+        self.status = if enabled {
+            "Rule enabled.".into()
+        } else {
+            "Rule disabled.".into()
+        };
+        Ok(self.status.clone())
     }
 
     /// Updates the active profile's rule for one app and persists it
@@ -1681,64 +1893,98 @@ impl AppState {
     /// A rule whose app was never discovered is still registered (by its
     /// stored exe_path), so the watchdog injects the process when it later
     /// appears instead of silently dropping the rule at startup.
+    /// Resolves the active profile's enabled rules to (app_id, exe)
+    /// targets: the catalog app when discovered, otherwise the rule's
+    /// stored path. Rules with neither are omitted (the caller counts
+    /// them separately when it needs to).
+    fn active_profile_targets(&self) -> Vec<(Uuid, PathBuf)> {
+        let Some(pid) = self.store.active_profile else {
+            return Vec::new();
+        };
+        let Some(profile) = self.store.profiles.iter().find(|p| p.id == pid) else {
+            return Vec::new();
+        };
+        if !profile.enabled {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for rule in &profile.rules {
+            if !rule.enabled {
+                continue;
+            }
+            let app = self.apps.iter().find(|a| a.id == rule.app_id).or_else(|| {
+                rule.exe_path.as_ref().and_then(|exe| {
+                    self.apps
+                        .iter()
+                        .find(|a| a.executable.eq_ignore_ascii_case(exe))
+                })
+            });
+            if let Some(app) = app {
+                out.push((app.id, PathBuf::from(&app.executable)));
+            } else if let Some(exe) = &rule.exe_path {
+                out.push((rule.app_id, PathBuf::from(exe)));
+            }
+        }
+        out
+    }
+
+    fn apply_targets(
+        &mut self,
+        targets: &[(Uuid, PathBuf)],
+        direct: &InterfaceInfo,
+    ) -> (usize, usize) {
+        let mut applied = 0;
+        let mut failed = 0;
+        for (id, exe) in targets {
+            match self.manager().apply(*id, exe.clone(), direct) {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    failed += 1;
+                    config::append_log(&format!("PROFILE_RULE_APPLY_FAILED app={} err={}", id, e));
+                }
+            }
+        }
+        (applied, failed)
+    }
+
+    /// apply_active_profile_rules for call sites that cannot show the
+    /// counts in a banner: failures are still written to the diagnostic
+    /// log with the calling context, instead of being discarded
+    /// entirely (startup, adapter select, revert and profile creation
+    /// used to drop them silently).
+    fn apply_rules_and_log(&mut self, context: &str) {
+        let (applied, failed) = self.apply_active_profile_rules();
+        if failed > 0 {
+            config::append_log(&format!(
+                "PROFILE_APPLY_CALLER {} applied={} failed={}",
+                context, applied, failed
+            ));
+        }
+    }
+
     pub fn apply_active_profile_rules(&mut self) -> (usize, usize) {
         let Some(pid) = self.store.active_profile else {
             return (0, 0);
         };
-        let (enabled, rules) = match self.store.profiles.iter().find(|p| p.id == pid) {
-            Some(p) => (p.enabled, p.rules.clone()),
-            None => return (0, 0),
-        };
+        let (enabled, rule_count, enabled_count) =
+            match self.store.profiles.iter().find(|p| p.id == pid) {
+                Some(p) => (
+                    p.enabled,
+                    p.rules.len(),
+                    p.rules.iter().filter(|r| r.enabled).count(),
+                ),
+                None => return (0, 0),
+            };
         if !enabled {
             return (0, 0);
         }
-
         let Some(direct) = self.direct_interface().cloned() else {
             return (0, 0);
         };
-
-        let mut applied = 0;
-        let mut failed = 0;
-        let mut skipped = 0;
-        for rule in rules {
-            if rule.enabled {
-                let app = self.apps.iter().find(|a| a.id == rule.app_id).or_else(|| {
-                    if let Some(exe) = &rule.exe_path {
-                        self.apps
-                            .iter()
-                            .find(|a| a.executable.eq_ignore_ascii_case(exe))
-                    } else {
-                        None
-                    }
-                });
-
-                let target: Option<(Uuid, PathBuf)> = if let Some(app) = app {
-                    Some((app.id, PathBuf::from(&app.executable)))
-                } else if let Some(exe) = &rule.exe_path {
-                    Some((rule.app_id, PathBuf::from(exe)))
-                } else {
-                    None
-                };
-                match target {
-                    Some((id, exe)) => match self.manager().apply(id, exe, &direct) {
-                        Ok(()) => applied += 1,
-                        Err(e) => {
-                            failed += 1;
-                            config::append_log(&format!(
-                                "PROFILE_RULE_APPLY_FAILED app={} err={}",
-                                id, e
-                            ));
-                        }
-                    },
-                    None => {
-                        // No discovered app and no stored path: the rule
-                        // cannot be registered at all. It used to vanish
-                        // from every count, indistinguishable from success.
-                        skipped += 1;
-                    }
-                }
-            }
-        }
+        let targets = self.active_profile_targets();
+        let skipped = enabled_count.saturating_sub(targets.len());
+        let _ = rule_count;
+        let (applied, failed) = self.apply_targets(&targets, &direct);
         if failed > 0 || skipped > 0 {
             config::append_log(&format!(
                 "PROFILE_APPLY applied={} failed={} skipped_no_path={}",
@@ -1754,6 +2000,27 @@ impl AppState {
     pub fn tick_watchdog(&mut self) {
         if self.last_watchdog.elapsed().as_millis() > 1500 {
             self.last_watchdog = Instant::now();
+            // Watchdog supervision: a panic inside the cycle kills the
+            // thread silently (its spawn handle is fire-and-forget).
+            // When no cycle has started for 45 s — far beyond a slow
+            // injection phase — assume it died and respawn it. A merely
+            // slow thread that later wakes up is harmless: it publishes
+            // the same snapshots, and the commit race guard covers any
+            // doubled commits.
+            let beat_stale = self
+                .watchdog_beat
+                .lock()
+                .map(|b| b.elapsed().as_secs() >= 45)
+                .unwrap_or(false);
+            if beat_stale {
+                config::append_log(
+                    "WATCHDOG_THREAD_STALE no cycle for 45s; respawning watchdog thread",
+                );
+                if let Ok(mut b) = self.watchdog_beat.lock() {
+                    *b = Instant::now();
+                }
+                self.spawn_watchdog_thread();
+            }
             // Prefer the watchdog thread's snapshot; compute directly
             // only when the thread has not published one yet.
             if !self.apply_watchdog_cache() {
@@ -1771,9 +2038,6 @@ impl AppState {
     /// are throttled to an adapter change or one per 15 s while the
     /// manager has no registered rules.
     fn maybe_retry_profile_apply(&mut self) {
-        if self.active_bypass_count() > 0 {
-            return;
-        }
         let Some(direct) = self.direct_interface().cloned() else {
             return;
         };
@@ -1785,17 +2049,27 @@ impl AppState {
         if !usable {
             return;
         }
-        let has_pending_rules = match self.store.active_profile {
-            Some(pid) => self
-                .store
-                .profiles
-                .iter()
-                .find(|p| p.id == pid)
-                .map(|p| p.enabled && p.rules.iter().any(|r| r.enabled))
-                .unwrap_or(false),
-            None => false,
-        };
-        if !has_pending_rules {
+        // Per-rule pending check: the old guard stopped retrying as soon
+        // as ANY bypass was registered, so in a partially-applied profile
+        // the rules that had failed at startup stayed failed forever
+        // while the UI implied the profile was active. A rule counts as
+        // pending when the manager has no entry for it or its entry is
+        // Failed; Live and Pending (awaiting process) are satisfied and
+        // are NOT re-applied (re-applying a live rule re-runs injection
+        // into already-hooked processes).
+        let targets = self.active_profile_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let status_map = self.manager().live_status_map();
+        let pending: Vec<(Uuid, PathBuf)> = targets
+            .into_iter()
+            .filter(|(id, _)| match status_map.get(id) {
+                None => true,
+                Some((status, _, _)) => *status == BypassLiveStatus::Failed,
+            })
+            .collect();
+        if pending.is_empty() {
             return;
         }
         let adapter_changed = self.last_profile_retry_adapter != self.selected_direct_if;
@@ -1808,7 +2082,7 @@ impl AppState {
         }
         self.last_profile_retry = Some(Instant::now());
         self.last_profile_retry_adapter = self.selected_direct_if;
-        let (applied, _failed) = self.apply_active_profile_rules();
+        let (applied, _failed) = self.apply_targets(&pending, &direct);
         if applied > 0 {
             self.recompute_paused();
         }
