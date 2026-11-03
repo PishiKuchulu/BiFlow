@@ -12,6 +12,10 @@ pub fn generate_app_id(executable: &str) -> Uuid {
 
 pub fn discover() -> Vec<AppEntry> {
     let mut map: HashMap<String, AppEntry> = HashMap::new();
+    // Discovery failures used to be indistinguishable from "no apps":
+    // every registry error was swallowed silently, so a broken hive read
+    // looked exactly like an empty catalog.
+    let mut failures = 0usize;
 
     for (hive, source) in [
         (RegKey::predef(HKEY_LOCAL_MACHINE), "HKLM"),
@@ -24,10 +28,12 @@ pub fn discover() -> Vec<AppEntry> {
 
         for base_path in paths {
             let Ok(base) = hive.open_subkey(base_path) else {
+                failures += 1;
                 continue;
             };
             for key_name in base.enum_keys().flatten() {
                 let Ok(key) = base.open_subkey(&key_name) else {
+                    failures += 1;
                     continue;
                 };
 
@@ -138,7 +144,6 @@ pub fn discover() -> Vec<AppEntry> {
                     executable,
                     version,
                     source: source.to_string(),
-                    valid: true,
                 });
             }
         }
@@ -167,11 +172,18 @@ pub fn discover() -> Vec<AppEntry> {
                         executable: clean.to_string(),
                         version: None,
                         source: format!("{} AppPaths", source),
-                        valid: true,
                     });
                 }
             }
         }
+    }
+
+    if failures > 0 {
+        crate::config::append_log(&format!(
+            "DISCOVERY_PARTIAL failures={} apps={}",
+            failures,
+            map.len()
+        ));
     }
 
     let mut out: Vec<_> = map.into_values().collect();
@@ -184,6 +196,16 @@ pub fn pick_executable_file() -> Option<AppEntry> {
         .add_filter("Executable File", &["exe"])
         .set_title("Select Application Executable")
         .pick_file()?;
+
+    // The dialog's filter is advisory only ("All files" bypasses it):
+    // re-validate what came back before it becomes a persistent custom
+    // app that rules and firewall entries will trust.
+    let is_exe = file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if !is_exe || !file.exists() {
+        return None;
+    }
 
     let file_name = file
         .file_stem()
@@ -200,7 +222,6 @@ pub fn pick_executable_file() -> Option<AppEntry> {
         executable: exe_str,
         version: None,
         source: "Custom".into(),
-        valid: true,
     })
 }
 
@@ -209,16 +230,20 @@ pub fn discover_running_processes() -> Vec<AppEntry> {
     let mut out = Vec::new();
 
     for (_pid, name, path) in procs {
+        // An entry without a full path is unusable everywhere downstream
+        // (rules, injection, firewall all key on paths) and its
+        // name-derived ID could collide with ANY same-named binary. The
+        // producer already guarantees absolute paths; this filter keeps
+        // the junk-entry class out even if that ever changes.
+        if path.is_empty() {
+            continue;
+        }
         let display_name = Path::new(&path)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| name.clone());
 
-        let id = if !path.is_empty() {
-            generate_app_id(&path)
-        } else {
-            generate_app_id(&name)
-        };
+        let id = generate_app_id(&path);
 
         out.push(AppEntry {
             id,
@@ -227,7 +252,6 @@ pub fn discover_running_processes() -> Vec<AppEntry> {
             executable: path,
             version: None,
             source: "Running".into(),
-            valid: true,
         });
     }
 
