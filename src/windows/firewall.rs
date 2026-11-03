@@ -115,9 +115,22 @@ pub fn block_app(app_id: &Uuid, app_name: &str, exe_path: &str) -> Result<(), St
                 ));
             }
             Err(e) => {
+                // The rules may exist even though verification failed:
+                // leaving them while the caller reports failure would
+                // diverge firewall state from the UI. Attempt the same
+                // verified cleanup as the partial-success branch and
+                // say what actually happened (round-2 audit).
+                let _ = run_netsh(&delete_args);
+                let removed = matches!(query_rule_directions(app_id), Ok((false, false)));
                 return Err(format!(
-                    "Firewall block for {} could not be verified: {}",
-                    app_name, e
+                    "Firewall block for {} could not be verified: {}; {}",
+                    app_name,
+                    e,
+                    if removed {
+                        "any partially created rules were removed"
+                    } else {
+                        "cleanup of possibly-created rules could not be confirmed — check Windows Firewall for leftover rules"
+                    }
                 ));
             }
         }
