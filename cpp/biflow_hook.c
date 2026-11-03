@@ -10,7 +10,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-// BiFlow Winsock hook DLL (v0.3.2).
+// BiFlow Winsock hook DLL (v0.3.3).
 //
 // Strategy: outbound client sockets are bound to the IPv4 address of the
 // physical ("direct") adapter BiFlow selected. On Windows, binding a socket to
@@ -98,8 +98,14 @@ static int g_this_exe_allowed = 1; // 0 when this exe was removed from bypass
 static ULONGLONG g_last_check_ms = 0;
 
 static volatile LONG g_hooks_ready = 0;
-static int g_hooks_installed = 0;
 
+// Strict dotted-quad parser. inet_addr also accepts non-standard forms
+// ("1234", hex/octet-shorthand components), which would let a malformed
+// policy file mean something other than the address BiFlow wrote. Only
+// exactly four decimal octets 0-255 are accepted; the result is in the
+// same byte order inet_addr returned (first octet in the low byte), and
+// 0.0.0.0 / 255.255.255.255 are rejected as before (treated as "no
+// target", i.e. bypass off).
 static uint32_t parse_ip_string(char *buf) {
   if (!buf)
     return 0;
@@ -121,11 +127,37 @@ static uint32_t parse_ip_string(char *buf) {
   if (*buf == '\0')
     return 0;
 
-  unsigned long ip = inet_addr(buf);
-  if (ip != INADDR_NONE && ip != 0) {
-    return (uint32_t)ip;
+  uint32_t octets[4];
+  const char *s = buf;
+  for (int i = 0; i < 4; i++) {
+    if (*s < '0' || *s > '9')
+      return 0;
+    uint32_t v = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+      v = v * 10u + (uint32_t)(*s - '0');
+      if (v > 255u)
+        return 0;
+      s++;
+      digits++;
+    }
+    if (digits == 0 || digits > 3)
+      return 0;
+    octets[i] = v;
+    if (i < 3) {
+      if (*s != '.')
+        return 0;
+      s++;
+    } else if (*s != '\0') {
+      return 0;
+    }
   }
-  return 0;
+
+  uint32_t ip = octets[0] | (octets[1] << 8) | (octets[2] << 16) |
+                (octets[3] << 24);
+  if (ip == 0 || ip == 0xFFFFFFFFu)
+    return 0;
+  return ip;
 }
 
 static void build_policy_paths(void) {
@@ -152,7 +184,8 @@ static void build_policy_paths(void) {
   }
 }
 
-// Fingerprint of all policy files (last-write times). 0 when none exist.
+// Fingerprint of all policy files (last-write times + sizes). 0 when
+// none exist.
 // Cheap: one GetFileAttributesExW per policy file.
 static uint64_t policy_files_tick(void) {
   const wchar_t *paths[2] = {g_path_target_pd, g_path_apps_pd};
@@ -165,6 +198,13 @@ static uint64_t policy_files_tick(void) {
       uint64_t t = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) |
                    (uint64_t)fad.ftLastWriteTime.dwLowDateTime;
       tick ^= t + 0x9e3779b97f4a7c15ULL + (tick << 6) + (tick >> 2);
+      // Mix the size in as well: two back-to-back policy writes can land
+      // on the same FILETIME tick, and a size change must still register
+      // as a policy change.
+      uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) |
+                    (uint64_t)fad.nFileSizeLow;
+      tick ^= (sz + 0x100ULL) + 0x9e3779b97f4a7c15ULL + (tick << 6) +
+              (tick >> 2);
     }
   }
   return tick;
@@ -311,9 +351,13 @@ static void bind_socket_if_needed(SOCKET s, const struct sockaddr_in *dest) {
   bind_addr.sin_port = 0;
   if (g_real_bind) {
     g_real_bind(s, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-  } else {
-    bind(s, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
   }
+  // No trampoline for bind: never call the imported bind() export from
+  // inside this DLL. If ws2_32!bind were patched (by this or another
+  // injector), that call would re-enter Hook_bind on this process's
+  // stack. Leaving the socket unbound is the safe outcome: the OS binds
+  // it implicitly on connect, on the default route, exactly as when a
+  // redirected bind fails above.
 }
 
 // True only for a complete IPv4 address: reading sa_family needs at
@@ -363,7 +407,11 @@ static int WSAAPI Hook_bind(SOCKET s, const struct sockaddr *name,
   if (g_real_bind) {
     return g_real_bind(s, name, namelen);
   }
-  return bind(s, name, namelen);
+  // Hook installed without a trampoline (should be impossible after the
+  // all-or-nothing install in init_thread): fail this one call instead
+  // of calling the imported export, which could re-enter this hook.
+  WSASetLastError(WSAEFAULT);
+  return SOCKET_ERROR;
 }
 
 static int WSAAPI Hook_connect(SOCKET s, const struct sockaddr *name,
@@ -374,7 +422,8 @@ static int WSAAPI Hook_connect(SOCKET s, const struct sockaddr *name,
   if (g_real_connect) {
     return g_real_connect(s, name, namelen);
   }
-  return connect(s, name, namelen);
+  WSASetLastError(WSAEFAULT);
+  return SOCKET_ERROR;
 }
 
 static int WSAAPI Hook_WSAConnect(SOCKET s, const struct sockaddr *name,
@@ -388,8 +437,8 @@ static int WSAAPI Hook_WSAConnect(SOCKET s, const struct sockaddr *name,
     return g_real_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData,
                              lpSQOS, lpGQOS);
   }
-  return WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS,
-                    lpGQOS);
+  WSASetLastError(WSAEFAULT);
+  return SOCKET_ERROR;
 }
 
 static int WSAAPI Hook_sendto(SOCKET s, const char *buf, int len, int flags,
@@ -402,7 +451,8 @@ static int WSAAPI Hook_sendto(SOCKET s, const char *buf, int len, int flags,
   if (g_real_sendto) {
     return g_real_sendto(s, buf, len, flags, to, tolen);
   }
-  return sendto(s, buf, len, flags, to, tolen);
+  WSASetLastError(WSAEFAULT);
+  return SOCKET_ERROR;
 }
 
 static int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF lpBuffers,
@@ -422,8 +472,8 @@ static int WSAAPI Hook_WSASendTo(SOCKET s, LPWSABUF lpBuffers,
                             dwFlags, lpTo, iToLen, lpOverlapped,
                             lpCompletionRoutine);
   }
-  return WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags,
-                   lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
+  WSASetLastError(WSAEFAULT);
+  return SOCKET_ERROR;
 }
 
 // Report hook installation status so BiFlow's UI can be honest about whether
@@ -497,14 +547,28 @@ static DWORD WINAPI init_thread(LPVOID param) {
                        (LPVOID *)&g_real_WSASendTo) == MH_OK)
     installed++;
 
-  if (installed == 0 || MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+  // All-or-nothing install: a partial hook set is worse than none. With
+  // e.g. connect hooked but bind not, the socket-pinning path degrades in
+  // ways neither side can describe honestly, and asymmetric trampoline
+  // states are exactly what the hooks' defensive tails must never see.
+  // The injector rejects anything but a full set anyway (it requires
+  // "OK 5"), so a partial install is torn down here instead of being
+  // enabled and reported as failed while staying live.
+  if (installed != 5) {
     char buf[64];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "ERR enable_hooks %d", installed);
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "ERR partial_hooks %d",
+                installed);
     write_status_file(buf);
+    MH_Uninitialize();
     return 0;
   }
 
-  g_hooks_installed = installed;
+  if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+    write_status_file("ERR enable_hooks");
+    MH_Uninitialize();
+    return 0;
+  }
+
   InterlockedExchange(&g_hooks_ready, 1);
   {
     char buf[64];
