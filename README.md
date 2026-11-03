@@ -43,7 +43,7 @@ It allows you to route designated applications (like Steam, Games, or Torrent cl
 * 📊 **Open-Connection Telemetry:** Live snapshot of running GUI applications and their open IPv4/IPv6 connections (a socket snapshot, not a traffic meter).
 * 🛡️ **One-Click Block:** Instantly cut any application off from new connections using native Windows Defender Firewall rules (both directions, verified after creation), and terminate its existing IPv4 TCP connections on the spot via `SetTcpEntry`. Existing IPv6 connections end on their own; new ones are blocked.
 * 🎮 **Direct Launch Mode:** Launch games and applications directly from BiFlow with the bypass hook pre-injected *before* the application makes its first network call.
-* 📋 **Smart Profiles:** Save rule sets (Gaming, Streaming, Work) and switch between them with one click. The Direct adapter choice is global and kept separate from profiles.
+* 📋 **Smart Profiles:** Save configurations (Gaming, Streaming, Work) with per-profile adapter selections — each profile stores its bypass rules and its Direct adapter choice, applied when you switch to it — plus live change detection and one-click revert.
 * 🗕 **System Tray Integration:** Docks into the Windows notification area with background watchdog monitoring.
 * 🔒 **UAC-Safe Autostart:** Starts automatically at Windows logon via Task Scheduler with Administrator privileges and no UAC prompts — provided `BiFlow.exe` lives in a protected location (e.g. Program Files), which BiFlow verifies before registering the task.
 
@@ -78,7 +78,7 @@ Optional: verify your download against the `SHA256SUMS.txt` published with each 
 * 📊 **تله‌متری کانکشن‌های باز:** نمای لحظه‌ای از برنامه‌های در حال اجرا و کانکشن‌های باز IPv4/IPv6 آن‌ها (نمای سوکت‌های باز است، نه شمارندهٔ ترافیک).
 * 🛡️ **قطع فوری با یک کلیک:** همهٔ کانکشن‌های جدید هر برنامه را در هر دو جهت با فایروال خودِ ویندوز Defender ببندید (قانون‌ها بعد از ساخت راستی‌آزمایی می‌شوند) و کانکشن‌های TCP موجود IPv4 آن را بلافاصله با `SetTcpEntry` خاتمه دهید. کانکشن‌های IPv6 موجود خودشان پایان می‌یابند و کانکشن جدیدشان بلاک است.
 * 🎮 **حالت Direct Launch:** بازی‌ها را مستقیماً از داخل BiFlow اجرا کنید تا هوکِ بای‌پس **قبل از اولین درخواست شبکه** به پروسس بازی تزریق شود.
-* 📋 **پروفایل‌های هوشمند:** مجموعه‌قانون‌های مختلف (گیمینگ، استریم، کار) را ذخیره کنید و با یک کلیک بین آن‌ها جابه‌جا شوید. انتخاب آداپتور مستقیم سراسری است و جدا از پروفایل‌ها نگه داشته می‌شود.
+* 📋 **پروفایل‌های هوشمند:** تنظیمات مختلف (گیمینگ، استریم، کار) را ذخیره کنید و با یک کلیک بین آن‌ها جابه‌جا شوید؛ هر پروفایل انتخاب آداپتور مستقیم خودش را هم نگه می‌دارد و هنگام جابه‌جایی به آن پروفایل اعمال می‌کند.
 * 🗕 **حضور در System Tray:** اجرای آرام در پس‌زمینه و نظارت مداوم (Watchdog) روی وضعیت شبکه.
 * 🔒 **اجرای خودکار بدون دردسر UAC:** اجرای خودکار هنگام ورود به ویندوز (Logon) با Task Scheduler و دسترسی ادمین، بدون نمایش پنجره‌های آزاردهنده UAC — به این شرط که فایل `BiFlow.exe` در یک مکان محافظت‌شده (مثل Program Files) باشد؛ BiFlow این شرط را پیش از ثبت تسک بررسی می‌کند.
 
