@@ -26,7 +26,9 @@ pub fn system_powershell() -> std::path::PathBuf {
 
 fn system32_dir() -> std::path::PathBuf {
     unsafe {
-        let mut buf = vec![0u16; 32768];
+        // The System32 path is short; a stack buffer is plenty (this used
+        // to allocate a 64 KiB heap vector on every spawned tool call).
+        let mut buf = [0u16; 1024];
         let n = windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
             buf.as_mut_ptr(),
             buf.len() as u32,
@@ -41,7 +43,7 @@ fn system32_dir() -> std::path::PathBuf {
 }
 
 #[cfg(windows)]
-pub fn get_main_window_hwnd() -> windows_sys::Win32::Foundation::HWND {
+pub(crate) fn get_main_window_hwnd() -> windows_sys::Win32::Foundation::HWND {
     struct SearchData {
         pid: u32,
         hwnd: windows_sys::Win32::Foundation::HWND,
