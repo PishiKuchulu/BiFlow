@@ -7,6 +7,7 @@ use tray_icon::{
 
 static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DISABLE_ALL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RESUME_REQUESTED: AtomicBool = AtomicBool::new(false);
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static EGUI_CTX: Mutex<Option<eframe::egui::Context>> = Mutex::new(None);
 
@@ -24,6 +25,10 @@ pub fn take_disable_all_requested() -> bool {
     DISABLE_ALL_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
+pub fn take_resume_requested() -> bool {
+    RESUME_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
 pub fn take_exit_requested() -> bool {
     EXIT_REQUESTED.swap(false, Ordering::SeqCst)
 }
@@ -37,27 +42,50 @@ fn trigger_repaint() {
 }
 
 pub struct BiFlowTray {
-    _tray_icon: TrayIcon,
+    tray_icon: TrayIcon,
 }
 
 impl BiFlowTray {
+    /// Pushes live engine state into the tray tooltip. Without this the
+    /// tray is a one-way surface: it accepts actions but never reflects
+    /// how many bypasses are actually live, so a user whose bypasses
+    /// silently fail-closed (adapter unplugged) gets no hint from the
+    /// place they are most likely to glance at.
+    pub fn set_tooltip(&self, text: &str) {
+        let _ = self.tray_icon.set_tooltip(Some(text));
+    }
+
     pub fn new() -> Result<Self, String> {
         let icon = create_app_icon()?;
 
         let menu = Menu::new();
         let show_item = MenuItem::new("Open BiFlow", true, None);
         let disable_all_item = MenuItem::new("Disable All Bypasses", true, None);
+        let resume_item = MenuItem::new("Resume Bypasses", true, None);
         let separator = PredefinedMenuItem::separator();
         let exit_item = MenuItem::new("Exit", true, None);
 
         let show_id = show_item.id().clone();
         let disable_id = disable_all_item.id().clone();
+        let resume_id = resume_item.id().clone();
         let exit_id = exit_item.id().clone();
 
-        let _ = menu.append(&show_item);
-        let _ = menu.append(&disable_all_item);
-        let _ = menu.append(&separator);
-        let _ = menu.append(&exit_item);
+        // A silently swallowed append failure means a menu item simply
+        // never exists and nobody ever learns why; record it.
+        for (label, res) in [
+            ("Open BiFlow", menu.append(&show_item)),
+            ("Disable All Bypasses", menu.append(&disable_all_item)),
+            ("Resume Bypasses", menu.append(&resume_item)),
+            ("separator", menu.append(&separator)),
+            ("Exit", menu.append(&exit_item)),
+        ] {
+            if let Err(e) = res {
+                crate::config::append_log(&format!(
+                    "TRAY_MENU_APPEND_FAILED item={} err={}",
+                    label, e
+                ));
+            }
+        }
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -82,6 +110,9 @@ impl BiFlowTray {
             } else if event.id == disable_id {
                 DISABLE_ALL_REQUESTED.store(true, Ordering::SeqCst);
                 trigger_repaint();
+            } else if event.id == resume_id {
+                RESUME_REQUESTED.store(true, Ordering::SeqCst);
+                trigger_repaint();
             }
         }));
 
@@ -102,9 +133,7 @@ impl BiFlowTray {
             _ => {}
         }));
 
-        Ok(Self {
-            _tray_icon: tray_icon,
-        })
+        Ok(Self { tray_icon })
     }
 }
 
