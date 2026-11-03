@@ -37,8 +37,30 @@ pub fn log_path() -> PathBuf {
     data_dir().join("biflow.log")
 }
 
+/// Backs an unloadable config file up under a collision-safe
+/// `.corrupt.<unix-seconds>[.n]` name and returns the backup path.
+fn backup_corrupt_config(path: &std::path::Path) -> Option<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut backup = path.with_extension(format!("json.corrupt.{}", ts));
+    let mut n = 1;
+    while backup.exists() {
+        backup = path.with_extension(format!("json.corrupt.{}.{}", ts, n));
+        n += 1;
+    }
+    fs::rename(path, &backup).ok().map(|_| backup)
+}
+
 pub fn load() -> io::Result<Store> {
     let path = store_path();
+    // Sweep an orphaned temp config left by a crashed save (panic=abort
+    // orphans it exactly like a crash); it is never valid data.
+    let tmp = path.with_extension("tmp");
+    if tmp.exists() {
+        let _ = fs::remove_file(&tmp);
+    }
     if !path.exists() {
         return Ok(Store::default());
     }
@@ -46,18 +68,42 @@ pub fn load() -> io::Result<Store> {
     // the caller can tell "no config yet" apart from "config unreadable"
     // and avoid overwriting the real config with defaults on the next save.
     let raw = fs::read_to_string(&path)?;
-    match serde_json::from_str(&raw) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            // Never silently discard the user's config: back the corrupt
-            // file up before falling back to defaults.
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let backup = path.with_extension(format!("json.corrupt.{}", ts));
-            let _ = fs::rename(&path, &backup);
-            Ok(Store::default())
+    match serde_json::from_str::<Store>(&raw) {
+        Ok(store) => {
+            if store.schema_version > crate::models::CURRENT_SCHEMA_VERSION {
+                // Written by a NEWER BiFlow: this build cannot know what
+                // its fields mean, and re-saving would silently drop
+                // them. Back the file up and refuse, exactly like a
+                // corrupt file, instead of downgrading it in place.
+                let backup = backup_corrupt_config(&path);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Config schema version {} is newer than this build supports ({}); the file was preserved as {:?}",
+                        store.schema_version,
+                        crate::models::CURRENT_SCHEMA_VERSION,
+                        backup.map(|b| b.to_string_lossy().to_string())
+                    ),
+                ));
+            }
+            Ok(store)
+        }
+        Err(e) => {
+            // A config that exists but does not parse is damage, not
+            // "no config yet": it takes the SAME protective path as a
+            // read error (caller disables saving and keeps running on
+            // defaults). Silently resetting with saving enabled used to
+            // let the next save permanently replace a merely-truncated
+            // config with factory defaults.
+            let backup = backup_corrupt_config(&path);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Config file is corrupt ({}); preserved as {:?}, starting from defaults with saving disabled",
+                    e,
+                    backup.map(|b| b.to_string_lossy().to_string())
+                ),
+            ))
         }
     }
 }
@@ -117,6 +163,14 @@ fn format_timestamp_utc(secs: u64) -> String {
 }
 
 pub fn append_log(line: &str) {
+    // One lock for all writers (UI thread, watchdog thread): the
+    // check-size → rotate → append sequence was racy, so a rotation could
+    // rename the file between another writer's check and append, dropping
+    // or garbling lines.
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_guard) = LOG_LOCK.lock() else {
+        return;
+    };
     let _ = fs::create_dir_all(data_dir());
     let path = log_path();
     // Rotate the log instead of growing it without bound.
@@ -125,6 +179,10 @@ pub fn append_log(line: &str) {
             let _ = fs::rename(&path, path.with_extension("log.old"));
         }
     }
+    // Single physical line per call: values interpolated by callers (app
+    // names come from the registry!) must never be able to forge extra
+    // log lines with embedded newlines.
+    let line = line.replace(['\r', '\n'], " ");
     let _ = fs::OpenOptions::new()
         .create(true)
         .append(true)
