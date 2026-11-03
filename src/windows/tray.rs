@@ -43,6 +43,8 @@ fn trigger_repaint() {
 
 pub struct BiFlowTray {
     tray_icon: TrayIcon,
+    disable_all_item: MenuItem,
+    resume_item: MenuItem,
 }
 
 impl BiFlowTray {
@@ -53,6 +55,15 @@ impl BiFlowTray {
     /// place they are most likely to glance at.
     pub fn set_tooltip(&self, text: &str) {
         let _ = self.tray_icon.set_tooltip(Some(text));
+    }
+
+    /// Reflects engine state in the tray MENU, not just the tooltip:
+    /// "Disable All" is only meaningful with live, unpaused bypasses,
+    /// and "Resume" only while paused. Both used to be always enabled,
+    /// with Resume a silent no-op in every other state.
+    pub fn set_menu_state(&self, paused: bool, any_active: bool) {
+        self.disable_all_item.set_enabled(any_active && !paused);
+        self.resume_item.set_enabled(paused);
     }
 
     pub fn new() -> Result<Self, String> {
@@ -133,7 +144,11 @@ impl BiFlowTray {
             _ => {}
         }));
 
-        Ok(Self { tray_icon })
+        Ok(Self {
+            tray_icon,
+            disable_all_item,
+            resume_item,
+        })
     }
 }
 
