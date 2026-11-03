@@ -17,14 +17,20 @@ const EMBEDDED_HOOK_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/biflo
 
 /// Versioned hook DLL file name, so an updated BiFlow never fights over a
 /// DLL file that is still loaded (and therefore locked) in target processes.
-pub fn hook_dll_file_name() -> String {
+pub(crate) fn hook_dll_file_name() -> String {
     format!(
         "biflow_hook64_v{}.dll",
         env!("CARGO_PKG_VERSION").replace('.', "_")
     )
 }
 
-static ACL_ONCE: std::sync::Once = std::sync::Once::new();
+/// Root-ACL latch: 0 = not applied yet, 1 = applied, 2 = failed (and the
+/// failure already logged once). A plain `Once` would consume the single
+/// attempt even on failure and leave the root folder unprotected for the
+/// process lifetime with no retry; latching only success keeps the retry
+/// while the state-2 latch keeps a persistent failure from spamming the
+/// log on every call.
+static ACL_ROOT_STATE: std::sync::Mutex<u8> = std::sync::Mutex::new(0);
 
 /// %ProgramData%\BiFlow — the protected home of the hook DLL and the policy
 /// files. On first use its DACL is replaced (best effort) with a protected
@@ -41,9 +47,23 @@ pub fn biflow_programdata_dir() -> Option<PathBuf> {
     let prog = std::env::var("ProgramData").ok()?;
     let dir = PathBuf::from(prog).join("BiFlow");
     let _ = fs::create_dir_all(&dir);
-    ACL_ONCE.call_once(|| {
-        let _ = apply_protected_acl(&dir);
-    });
+    // Best-effort root ACL on first use, retried on later calls until it
+    // succeeds once (security-critical consumers additionally re-apply it
+    // with checked calls). A failure is logged once per latch state
+    // instead of being swallowed forever.
+    if let Ok(mut state) = ACL_ROOT_STATE.lock() {
+        if *state != 1 {
+            match apply_protected_acl(&dir) {
+                Ok(()) => *state = 1,
+                Err(e) => {
+                    if *state == 0 {
+                        crate::config::append_log(&format!("ROOT_ACL_APPLY_FAILED {}", e));
+                    }
+                    *state = 2;
+                }
+            }
+        }
+    }
     Some(dir)
 }
 
@@ -63,19 +83,21 @@ const STATUS_ACL_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GW
 /// protection. Uses SetNamedSecurityInfoW (the documented replacement for
 /// the superseded SetFileSecurityW).
 pub fn apply_protected_acl(path: &Path) -> Result<(), String> {
-    apply_acl_sddl(path, POLICY_ACL_SDDL)
+    // Users ACE mask for the policy ACL: GRGX = GENERIC_READ | GENERIC_EXECUTE.
+    apply_acl_sddl(path, POLICY_ACL_SDDL, 0x8000_0000 | 0x2000_0000)
 }
 
 /// Applies the status-directory ACL (owner Administrators + protected
 /// DACL + user write access for hook reports). See STATUS_ACL_SDDL.
-pub fn apply_status_acl(path: &Path) -> Result<(), String> {
-    apply_acl_sddl(path, STATUS_ACL_SDDL)
+pub(crate) fn apply_status_acl(path: &Path) -> Result<(), String> {
+    // Users ACE mask for the status ACL: GW = GENERIC_WRITE.
+    apply_acl_sddl(path, STATUS_ACL_SDDL, 0x4000_0000)
 }
 
-fn apply_acl_sddl(path: &Path, sddl_str: &str) -> Result<(), String> {
+fn apply_acl_sddl(path: &Path, sddl_str: &str, users_mask: u32) -> Result<(), String> {
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     // O:BA = owner Administrators. Setting the owner matters as much as the
     // DACL: an object's owner implicitly holds WRITE_DAC, so a DACL-only
@@ -141,52 +163,227 @@ fn apply_acl_sddl(path: &Path, sddl_str: &str) -> Result<(), String> {
                 err
             ));
         }
-        // Verify the owner really is Administrators now: a silent no-op
-        // here would leave the WRITE_DAC loophole in place while the code
-        // claims the object is protected.
+        // Verify the result by reading the security descriptor back: the
+        // owner must really be Administrators (a silent no-op here would
+        // leave the WRITE_DAC loophole in place) AND the DACL must be
+        // exactly the expected ACE set. Verifying only the owner used to
+        // let a DACL that SetNamedSecurityInfoW applied differently (or
+        // not at all) pass while the code claimed the object protected.
         let mut actual_owner: PSID = null_mut();
+        let mut actual_dacl: *mut ACL = null_mut();
         let mut read_sd: PSECURITY_DESCRIPTOR = null_mut();
         let rerr = GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut actual_owner,
             null_mut(),
-            null_mut(),
+            &mut actual_dacl,
             null_mut(),
             &mut read_sd,
         );
-        if rerr != 0 || actual_owner.is_null() {
+        if rerr != 0 || actual_owner.is_null() || actual_dacl.is_null() {
             if !read_sd.is_null() {
                 LocalFree(read_sd as HLOCAL);
             }
             return Err(format!(
-                "Could not verify ACL owner for {} (Win32 error {})",
+                "Could not verify ACL for {} (Win32 error {})",
                 path.display(),
                 rerr
             ));
         }
-        let mut sid_str: windows_sys::core::PWSTR = null_mut();
-        let cok = ConvertSidToStringSidW(actual_owner, &mut sid_str);
-        let mut verified = false;
-        if cok != 0 && !sid_str.is_null() {
-            let mut len = 0usize;
-            while *sid_str.add(len) != 0 {
-                len += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len));
-            verified = s == "S-1-5-32-544";
-            LocalFree(sid_str as HLOCAL);
-        }
+        let owner_ok = sid_to_string(actual_owner).as_deref() == Some("S-1-5-32-544");
+        let dacl_ok = verify_expected_dacl(actual_dacl, users_mask);
         LocalFree(read_sd as HLOCAL);
-        if !verified {
+        if !owner_ok {
             return Err(format!(
                 "ACL owner verification failed for {} (owner is not Administrators)",
                 path.display()
             ));
         }
+        if !dacl_ok {
+            return Err(format!(
+                "ACL DACL verification failed for {} (read-back ACEs differ from the expected set)",
+                path.display()
+            ));
+        }
     }
     Ok(())
+}
+
+/// Returns Some(true) when the DACL of `path` grants write-like rights
+/// (write data / append / delete / write DAC / generic write or all) to
+/// any untrusted principal: Users, Authenticated Users, Everyone,
+/// CREATOR OWNER, or the current user personally. None when the DACL
+/// cannot be read (callers must fail closed). Used by the autostart gate,
+/// where a lexical path-prefix test is NOT enough: a user-created
+/// subfolder of %ProgramData% passes a prefix test while being fully
+/// writable by its creator.
+pub(crate) fn path_grants_untrusted_write(path: &Path, current_user_sid: &str) -> Option<bool> {
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    const DANGEROUS_MASK: u32 = 0x4000_0000  // GENERIC_WRITE
+        | 0x1000_0000  // GENERIC_ALL
+        | 0x0200_0000  // MAXIMUM_ALLOWED
+        | 0x0000_0002  // FILE_WRITE_DATA
+        | 0x0000_0004  // FILE_APPEND_DATA
+        | 0x0000_0040  // FILE_DELETE_CHILD
+        | 0x0001_0000  // DELETE
+        | 0x0004_0000  // WRITE_DAC
+        | 0x0008_0000; // WRITE_OWNER
+    let untrusted = [
+        "S-1-5-32-545", // Users
+        "S-1-5-11",     // Authenticated Users
+        "S-1-1-0",      // Everyone
+        "S-1-3-0",      // CREATOR OWNER
+        current_user_sid,
+    ];
+    unsafe {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl: *mut ACL = null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        let err = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut sd,
+        );
+        if err != 0 || dacl.is_null() {
+            if !sd.is_null() {
+                LocalFree(sd as HLOCAL);
+            }
+            return None;
+        }
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAce, GetAclInformation, ACL_SIZE_INFORMATION,
+        };
+        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+        let ok = GetAclInformation(
+            dacl,
+            &mut info as *mut ACL_SIZE_INFORMATION as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        );
+        if ok == 0 {
+            LocalFree(sd as HLOCAL);
+            return None;
+        }
+        let mut grants = false;
+        for i in 0..info.AceCount {
+            let mut ace_ptr: *mut core::ffi::c_void = null_mut();
+            if GetAce(dacl, i, &mut ace_ptr) == 0 || ace_ptr.is_null() {
+                LocalFree(sd as HLOCAL);
+                return None;
+            }
+            let ace_bytes = ace_ptr as *const u8;
+            if *ace_bytes != 0 {
+                continue; // not an access-allowed ACE
+            }
+            let mask = std::ptr::read_unaligned(ace_bytes.add(4) as *const u32);
+            if mask & DANGEROUS_MASK == 0 {
+                continue;
+            }
+            let sid = ace_bytes.add(8) as PSID;
+            if let Some(s) = sid_to_string(sid) {
+                if untrusted.contains(&s.as_str()) {
+                    grants = true;
+                    break;
+                }
+            }
+        }
+        LocalFree(sd as HLOCAL);
+        Some(grants)
+    }
+}
+
+/// Converts a SID to its string form ("S-1-5-32-544") for comparison.
+unsafe fn sid_to_string(sid: PSID) -> Option<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    if sid.is_null() {
+        return None;
+    }
+    let mut sid_str: windows_sys::core::PWSTR = null_mut();
+    let cok = ConvertSidToStringSidW(sid, &mut sid_str);
+    if cok == 0 || sid_str.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while *sid_str.add(len) != 0 {
+        len += 1;
+    }
+    let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len));
+    LocalFree(sid_str as HLOCAL);
+    Some(s)
+}
+
+/// Verifies a read-back DACL contains EXACTLY the expected ACEs: SYSTEM
+/// and Administrators with FILE_ALL_ACCESS (0x001F01FF), Users with
+/// `users_mask`, every ACE an access-allowed ACE carrying OI|CI
+/// inheritance, and nothing else (no extra allow ACEs, no deny ACEs).
+unsafe fn verify_expected_dacl(dacl: *mut ACL, users_mask: u32) -> bool {
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, GetAce, GetAclInformation, ACL_SIZE_INFORMATION,
+    };
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
+    const ACE_FLAGS_OI_CI: u8 = 0x03;
+    if dacl.is_null() {
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = GetAclInformation(
+        dacl,
+        &mut info as *mut ACL_SIZE_INFORMATION as *mut core::ffi::c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    );
+    if ok == 0 || info.AceCount != 3 {
+        return false;
+    }
+    let expected: [(&str, u32); 3] = [
+        ("S-1-5-18", FILE_ALL_ACCESS),     // SYSTEM
+        ("S-1-5-32-544", FILE_ALL_ACCESS), // Administrators
+        ("S-1-5-32-545", users_mask),      // Users
+    ];
+    let mut seen = [false; 3];
+    for i in 0..info.AceCount {
+        let mut ace_ptr: *mut core::ffi::c_void = null_mut();
+        if GetAce(dacl, i, &mut ace_ptr) == 0 || ace_ptr.is_null() {
+            return false;
+        }
+        // ACCESS_ALLOWED_ACE layout: ACE_HEADER {AceType u8, AceFlags u8,
+        // AceSize u16}, Mask u32 at offset 4, SID at offset 8.
+        let ace_bytes = ace_ptr as *const u8;
+        let ace_type = *ace_bytes;
+        let ace_flags = *ace_bytes.add(1);
+        let mask = std::ptr::read_unaligned(ace_bytes.add(4) as *const u32);
+        if ace_type != ACE_TYPE_ACCESS_ALLOWED || (ace_flags & ACE_FLAGS_OI_CI) != ACE_FLAGS_OI_CI {
+            return false;
+        }
+        let sid = ace_bytes.add(8) as PSID;
+        let Some(sid_string) = sid_to_string(sid) else {
+            return false;
+        };
+        let mut matched = false;
+        for (idx, (want_sid, want_mask)) in expected.iter().enumerate() {
+            if !seen[idx] && sid_string == *want_sid && mask == *want_mask {
+                seen[idx] = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    seen.iter().all(|s| *s)
 }
 
 pub fn ensure_dll_extracted() -> Result<PathBuf, String> {
@@ -255,12 +452,33 @@ fn write_pd_policy_file(leaf: &str, content: &str) -> Result<(), String> {
     // protection: prove them on every publish, not just the file's.
     apply_protected_acl(&dir)?;
     let final_path = dir.join(leaf);
-    let tmp_path = dir.join(format!(".{}-{}.tmp", leaf, std::process::id()));
+    // The temp name must be unique per CALL, not per process: the UI
+    // thread and the watchdog thread both publish policy, and with a
+    // pid-only name two concurrent publishes of the same leaf shared one
+    // temp path and could rename each other's content.
+    static PUBLISH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PUBLISH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".{}-{}-{}.tmp", leaf, std::process::id(), seq));
     fs::write(&tmp_path, content)
         .map_err(|e| format!("Cannot write {}: {}", tmp_path.display(), e))?;
     // Flush to disk before the rename so a crash cannot leave a torn file.
-    if let Ok(f) = fs::File::open(&tmp_path) {
-        let _ = f.sync_all();
+    // A flush that cannot even start is a publish failure, not a detail to
+    // skip past while claiming crash-safety.
+    match fs::File::open(&tmp_path) {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("Cannot flush {}: {}", tmp_path.display(), e));
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Cannot reopen {} for flush: {}",
+                tmp_path.display(),
+                e
+            ));
+        }
     }
     fs::rename(&tmp_path, &final_path)
         .map_err(|e| format!("Cannot publish {}: {}", final_path.display(), e))?;
@@ -293,6 +511,7 @@ pub fn clear_target_ip() -> Result<(), String> {
     }
     paths.push(std::env::temp_dir().join("biflow_target_ip.txt"));
     paths.push(std::env::temp_dir().join("BiFlow").join("bypass_apps.txt"));
+    paths.push(std::env::temp_dir().join("BiFlow").join("target_ip.txt"));
     let mut first_err: Option<String> = None;
     for p in paths {
         if let Err(e) = fs::remove_file(&p) {
@@ -312,7 +531,7 @@ pub fn clear_target_ip() -> Result<(), String> {
 /// running with the user's normal token create its status report — under
 /// the policy folder's read-only-for-users ACL the report could never be
 /// written and every injection timed out as "not live".
-pub fn hook_status_dir() -> Option<PathBuf> {
+pub(crate) fn hook_status_dir() -> Option<PathBuf> {
     biflow_programdata_dir().map(|d| d.join("status"))
 }
 
@@ -322,7 +541,11 @@ pub fn hook_status_dir() -> Option<PathBuf> {
 fn ensure_status_dir() {
     if let Some(dir) = hook_status_dir() {
         let _ = fs::create_dir_all(&dir);
-        let _ = apply_status_acl(&dir);
+        if let Err(e) = apply_status_acl(&dir) {
+            // The fallback to %TEMP% keeps injection working, but the
+            // degradation is recorded instead of passing silently.
+            crate::config::append_log(&format!("STATUS_DIR_ACL_FAILED {}", e));
+        }
     }
 }
 
@@ -363,7 +586,12 @@ fn wait_for_hook_status(pid: u32) -> Result<u32, String> {
             if let Ok(content) = fs::read_to_string(&path) {
                 let content = content.trim().to_string();
                 if let Some(rest) = content.strip_prefix("OK ") {
-                    let n: u32 = rest.trim().parse().unwrap_or(0);
+                    let Ok(n) = rest.trim().parse::<u32>() else {
+                        return Err(format!(
+                            "Hook DLL in PID {} sent an unparseable hook report: {}",
+                            pid, content
+                        ));
+                    };
                     if n >= 5 {
                         return Ok(n);
                     }
@@ -624,9 +852,17 @@ unsafe fn shell_primary_token() -> Option<HANDLE> {
         return None;
     }
     let mut primary: HANDLE = null_mut();
+    // Least privilege for the duplicated primary token: only the rights
+    // CreateProcessWithTokenW and the logon plumbing actually need,
+    // instead of TOKEN_ALL_ACCESS on a token that becomes another
+    // process's identity.
     let ok = DuplicateTokenEx(
         token,
-        TOKEN_ALL_ACCESS,
+        TOKEN_ASSIGN_PRIMARY
+            | TOKEN_DUPLICATE
+            | TOKEN_QUERY
+            | TOKEN_ADJUST_DEFAULT
+            | TOKEN_ADJUST_SESSIONID,
         null_mut(),
         SecurityImpersonation,
         TokenPrimary,
@@ -771,48 +1007,12 @@ pub fn launch_with_bypass(exe: &Path, target_ip: &str) -> Result<LaunchOutcome, 
     }
 }
 
-#[allow(dead_code)]
-pub fn find_pids_by_exe_name(exe_name: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let lower_target = exe_name.to_ascii_lowercase();
-
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return pids;
-        }
-
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry
-                        .szExeFile
-                        .iter()
-                        .position(|&c| c == 0)
-                        .unwrap_or(entry.szExeFile.len())],
-                );
-                if name.to_ascii_lowercase() == lower_target {
-                    pids.push(entry.th32ProcessID);
-                }
-
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-
-        CloseHandle(snapshot);
-    }
-
-    pids
-}
-
 /// Find PIDs whose full executable path matches `exe` (case-insensitive).
-/// Unlike `find_pids_by_exe_name`, same-name binaries in other folders are
-/// never matched, so injection and connection teardown target the right app.
+/// Matching is by full path only: same-name binaries in other folders
+/// are never matched, so injection and connection teardown target the
+/// right app. (A basename-matching finder used to exist here and was
+/// removed deliberately: basename ambiguity is what the rest of the
+/// codebase is designed to avoid.)
 pub fn find_pids_by_exe_path(exe: &Path) -> Vec<u32> {
     let target = exe.to_string_lossy().to_ascii_lowercase();
     let mut pids = Vec::new();
@@ -849,7 +1049,7 @@ pub fn find_pids_by_exe_path(exe: &Path) -> Vec<u32> {
     pids
 }
 
-pub fn resolve_executable_path(name: &str) -> Option<String> {
+pub(crate) fn resolve_executable_path(name: &str) -> Option<String> {
     if Path::new(name).is_absolute() && Path::new(name).exists() {
         return Some(name.to_string());
     }
@@ -898,45 +1098,52 @@ pub fn resolve_executable_path(name: &str) -> Option<String> {
     None
 }
 
-pub fn get_process_full_path(pid: u32) -> Option<String> {
+pub(crate) fn get_process_full_path(pid: u32) -> Option<String> {
     // Long-path aware: the buffer covers the full Win32 long path limit.
-    let mut buf = vec![0u16; 32767];
-    for access in [PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_QUERY_INFORMATION] {
-        unsafe {
-            let process = OpenProcess(access, 0, pid);
-            if process.is_null() {
-                continue;
-            }
-            let mut len = buf.len() as u32;
-            let success = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len);
-            CloseHandle(process);
-            if success != 0 && len > 0 {
-                return Some(String::from_utf16_lossy(&buf[..len as usize]));
+    // It is allocated once per thread and reused: this runs once per PID
+    // per process-map pass, and a fresh 64 KiB vector per call meant
+    // ~19 MB of transient allocation for a 300-process pass.
+    thread_local! {
+        static PATH_BUF: std::cell::RefCell<Vec<u16>> =
+            std::cell::RefCell::new(vec![0u16; 32767]);
+    }
+    PATH_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        for access in [PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_QUERY_INFORMATION] {
+            unsafe {
+                let process = OpenProcess(access, 0, pid);
+                if process.is_null() {
+                    continue;
+                }
+                let mut len = buf.len() as u32;
+                let success = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len);
+                CloseHandle(process);
+                if success != 0 && len > 0 {
+                    return Some(String::from_utf16_lossy(&buf[..len as usize]));
+                }
             }
         }
-    }
-    None
+        None
+    })
 }
 
-/// (basename -> PIDs, PID -> parent PID, PID -> full executable path).
-/// The basename map exists for discovery; status decisions must use the
-/// full-path map, never the basename map.
+/// (PID -> parent PID, PID -> full executable path). There is
+/// deliberately no basename map: status decisions must use full paths,
+/// and the basename map an earlier version built here was discarded by
+/// every caller while still costing a pass over all processes.
 pub type ProcessMaps = (
-    std::collections::HashMap<String, Vec<u32>>,
     std::collections::HashMap<u32, u32>,
     std::collections::HashMap<u32, String>,
 );
 
 pub fn get_process_maps() -> ProcessMaps {
-    let mut name_map: std::collections::HashMap<String, Vec<u32>> =
-        std::collections::HashMap::new();
     let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut paths: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return (name_map, parents, paths);
+            return (parents, paths);
         }
 
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
@@ -955,11 +1162,6 @@ pub fn get_process_maps() -> ProcessMaps {
                 let parent_pid = entry.th32ParentProcessID;
 
                 if pid > 4 {
-                    name_map
-                        .entry(name.to_ascii_lowercase())
-                        .or_default()
-                        .push(pid);
-
                     parents.insert(pid, parent_pid);
 
                     if let Some(path) = get_process_full_path(pid) {
@@ -978,13 +1180,7 @@ pub fn get_process_maps() -> ProcessMaps {
         CloseHandle(snapshot);
     }
 
-    (name_map, parents, paths)
-}
-
-#[allow(dead_code)]
-pub fn get_all_running_processes_map() -> std::collections::HashMap<String, Vec<u32>> {
-    let (name_map, _, _) = get_process_maps();
-    name_map
+    (parents, paths)
 }
 
 pub fn get_running_gui_processes() -> Vec<(u32, String, String)> {
@@ -1012,7 +1208,6 @@ pub fn get_running_gui_processes() -> Vec<(u32, String, String)> {
                 // Filter out system internal OS processes
                 let lower = name.to_ascii_lowercase();
                 let skip = [
-                    "system",
                     "smss.exe",
                     "csrss.exe",
                     "wininit.exe",
