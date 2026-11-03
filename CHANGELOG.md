@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.3.3 — 2026-11-03
+
+Fix wave from the internal granular four-layer audit of v0.3.2
+(~48 findings; report only at the time). Every actionable finding is
+addressed below. One audit claim did not survive re-verification and is
+listed as such; the one remaining architectural item is declared
+openly at the end.
+
+Security:
+- Hook DLL: hook installation is now all-or-nothing — a partial hook
+  set is torn down (MH_Uninitialize) and reported as an error instead
+  of being enabled while the injector reported the injection failed.
+  Hook fallbacks never call the imported ws2_32 exports from inside
+  the DLL (defense-in-depth against re-entering a patched export);
+  a missing trampoline fails that one call. (Audit 🔴: on re-reading,
+  the claimed self-recursion crash was NOT reachable — an installed
+  hook always has its trampoline, and the direct-export fallback ran
+  only when the target export was not patched. The hardening above
+  removes the fragile pattern regardless.)
+- Autostart: the protected-location gate now verifies the executable
+  directory's actual DACL (no write-like rights for Users / Everyone /
+  Authenticated Users / CREATOR OWNER / the current user) on the
+  canonicalized path — a user-created subfolder of %ProgramData%
+  previously passed the prefix test. The task XML principal is the
+  current user's SID from the process token (never environment
+  variables, never silently omitted). Disabling autostart now verifies
+  BOTH the task and the Run key with a strict (tri-state) query.
+- ACL application now verifies the DACL read-back too (exact ACE set),
+  not only the owner. Policy-file temp names are unique per publish
+  (UI and watchdog threads could share a pid-only temp name), and a
+  failed pre-rename flush fails the publish.
+- Config: a corrupt config now takes the same protective path as an
+  unreadable one (preserved as a collision-safe `.corrupt` copy,
+  saving disabled, warning shown) instead of a silent reset with
+  saving enabled. `schema_version` is enforced (newer = refuse).
+  Nested config types carry serde defaults, so one malformed entry no
+  longer destroys the whole file. Load-time sanitizing merges
+  duplicate rules and drops rules/custom apps without absolute exe
+  paths. Removed the dead `Profile.priority` and `AppEntry.valid`
+  fields (old configs still load).
+- Firewall: netsh is invoked with argv arrays (the format-string +
+  re-tokenize layer is gone); PowerShell query helpers escape their
+  substitutions internally; a partial block's rollback removal is
+  verified before the error message may claim it; clear-all verifies
+  from one batch readback (was 2N+2 PowerShell spawns); startup
+  reconcile is one batch query; terminated-connection counts are
+  logged.
+- Shell token duplication uses least-privilege rights instead of
+  TOKEN_ALL_ACCESS; re-elevation forwards the original arguments
+  (e.g. `--minimized`).
+
+Reliability / logic:
+- Policy files publish allow-list first, then the target IP.
+  `apply`/`launch` refuse an empty exe name before mutating state.
+  Adapter-loss fail-close keeps truthful bookkeeping and retries when
+  the policy deletion fails (the failure is logged, not discarded).
+  Manual operations reset the adapter-missing counter. Partial
+  per-PID injection failures, profile-apply failures and skipped
+  rules are logged. Several previously discarded engine results
+  (profile switch/create/revert, adapter change, block pre-removal,
+  rule removal) are now surfaced in the status. Network-PID
+  enumeration distinguishes failure (None) from empty; adapter
+  enumeration retries buffer overflows. Discovery failures are logged;
+  the file picker re-validates .exe; pathless running entries are
+  dropped. Exit persists session preferences first.
+
+Performance:
+- The UI tick no longer enumerates processes, four connection tables
+  and adapters on the UI thread: the watchdog thread publishes its
+  snapshot and the tick consumes it. The process-path buffer is
+  thread-local (was a 64 KiB allocation per PID per pass); the
+  discarded basename process map is no longer built; watchdog
+  planning lowercases paths once per cycle. Elevation checks are
+  cached; the System32 lookup uses a stack buffer.
+
+UI/UX:
+- Action notifications are global (every tab), colored by outcome
+  (errors no longer render green), and survive tab switches.
+  The status bar colors failures red. Confirmation dialogs guard
+  profile deletion, rule removal, Unblock All, and choosing a VPN
+  adapter as Direct. Custom apps can be removed. Failed bypasses show
+  their reason under the row; the Live pill's hover lists helper
+  processes being bypassed and any policy-sync problem. The
+  "BYPASS CONFIGURED" pill is amber. Adapter cards for down /
+  APIPA / no-IPv4 adapters are not selectable, with the reason shown;
+  VPN cards carry a warning. Honest wording throughout ("Open
+  Connections", the firewall block description, the About claims).
+  Blocked apps are listed and manageable in Settings; profile rules
+  show and toggle their enabled state; per-app version/source are
+  shown; empty list state, Ctrl+F search focus, Unicode search,
+  Enter-to-create profile, duplicate-name and empty-rename guards.
+  The tray gained a Resume action and a live-state tooltip; a refused
+  tray Exit re-shows the window with the reason.
+
+Deliberately deferred (declared, not silently dropped): moving the
+blocking toggle/launch/block operations themselves off the UI thread
+is an architectural change to the apply flows; it is postponed until
+it can be validated on a real Windows device, rather than shipped
+unverifiable. Runtime behaviour on real Windows remains the open
+verification item, as with previous releases.
+
 ## v0.3.2 — 2026-11-01
 
 Third external review (14 findings: 4 P1 + 8 P2 + 2 P3, of v0.3.1 @
