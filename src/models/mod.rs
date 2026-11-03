@@ -1,20 +1,31 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// Every nested field carries a serde default: without them, a single
+// malformed or partially-written entry inside custom_apps / profiles /
+// rules made the WHOLE config unparseable and the loader reset
+// everything. With defaults, damage stays local to the bad entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppEntry {
+    #[serde(default)]
     pub id: Uuid,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub publisher: Option<String>,
+    #[serde(default)]
     pub executable: String,
+    #[serde(default)]
     pub version: Option<String>,
+    #[serde(default)]
     pub source: String,
-    pub valid: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BypassRule {
+    #[serde(default)]
     pub app_id: Uuid,
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub exe_path: Option<String>,
@@ -22,10 +33,13 @@ pub struct BypassRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
+    #[serde(default)]
     pub id: Uuid,
+    #[serde(default)]
     pub name: String,
+    #[serde(default = "default_true")]
     pub enabled: bool,
-    pub priority: i32,
+    #[serde(default)]
     pub rules: Vec<BypassRule>,
     #[serde(default)]
     pub adapter_index: Option<u32>,
@@ -43,7 +57,6 @@ impl Profile {
             id: Uuid::new_v4(),
             name: name.into(),
             enabled: true,
-            priority: 0,
             rules: Vec::new(),
             adapter_index: None,
             adapter_id: None,
@@ -86,21 +99,26 @@ fn default_true() -> bool {
     true
 }
 
+/// The config schema version this build writes and understands. The
+/// loader refuses a HIGHER version (a downgrade must not silently
+/// rewrite a newer config it cannot fully understand); lower versions
+/// load through the per-field serde defaults.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
 fn default_schema_version() -> u32 {
-    2
+    CURRENT_SCHEMA_VERSION
 }
 
 impl Default for Store {
     fn default() -> Self {
         let default_id = Uuid::new_v4();
         Self {
-            schema_version: 2,
+            schema_version: CURRENT_SCHEMA_VERSION,
             active_profile: Some(default_id),
             profiles: vec![Profile {
                 id: default_id,
                 name: "Default".into(),
                 enabled: true,
-                priority: 100,
                 rules: vec![],
                 adapter_index: None,
                 adapter_id: None,
@@ -155,5 +173,36 @@ mod tests {
         let json = serde_json::to_string(&rule).unwrap();
         let back: BypassRule = serde_json::from_str(&json).unwrap();
         assert_eq!(rule, back);
+    }
+
+    #[test]
+    fn partial_nested_entries_still_parse() {
+        // One incomplete profile / custom app / rule must degrade to
+        // defaults instead of making the whole config unparseable.
+        let json = r#"{
+            "profiles": [{"name": "P", "rules": [{"app_id": "12345678-1234-1234-1234-123456789abc"}]}],
+            "custom_apps": [{"name": "Half", "executable": "C:\\a\\b.exe"}]
+        }"#;
+        let store: Store = serde_json::from_str(json).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+        assert!(store.profiles[0].enabled);
+        assert_eq!(store.profiles[0].rules.len(), 1);
+        assert!(store.profiles[0].rules[0].enabled);
+        assert_eq!(store.custom_apps.len(), 1);
+        assert_eq!(store.custom_apps[0].executable, "C:\\a\\b.exe");
+        assert_eq!(store.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_priority_and_valid_fields_are_ignored() {
+        // Configs written before those dead fields were removed must keep
+        // loading (unknown fields are ignored by serde).
+        let json = r#"{
+            "profiles": [{"id": "12345678-1234-1234-1234-123456789abc", "name": "P", "enabled": true, "priority": 7, "rules": []}],
+            "custom_apps": [{"id": "12345678-1234-1234-1234-123456789abd", "name": "A", "publisher": null, "executable": "C:\\a.exe", "version": null, "source": "Custom", "valid": true}]
+        }"#;
+        let store: Store = serde_json::from_str(json).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+        assert_eq!(store.custom_apps.len(), 1);
     }
 }
