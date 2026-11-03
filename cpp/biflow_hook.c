@@ -10,7 +10,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-// BiFlow Winsock hook DLL (v0.3.3).
+// BiFlow Winsock hook DLL (v0.3.4).
 //
 // Strategy: outbound client sockets are bound to the IPv4 address of the
 // physical ("direct") adapter BiFlow selected. On Windows, binding a socket to
@@ -169,7 +169,12 @@ static void build_policy_paths(void) {
   g_path_apps_pd[0] = L'\0';
   g_path_status[0] = L'\0';
 
-  if (GetEnvironmentVariableW(L"ProgramData", prog, 1024) > 0) {
+  // Bound-check the return values: when the path does not fit, these
+  // APIs return the REQUIRED size and write nothing — treating any
+  // "> 0" as success would consume an uninitialized stack buffer as a
+  // path (round-2 audit).
+  DWORD prog_len = GetEnvironmentVariableW(L"ProgramData", prog, 1024);
+  if (prog_len > 0 && prog_len < 1024) {
     _snwprintf_s(g_path_target_pd, 1024, _TRUNCATE, L"%s\\BiFlow\\target_ip.txt",
                  prog);
     _snwprintf_s(g_path_apps_pd, 1024, _TRUNCATE, L"%s\\BiFlow\\bypass_apps.txt",
@@ -178,15 +183,22 @@ static void build_policy_paths(void) {
                  L"%s\\BiFlow\\status\\hook_status_%lu.txt", prog,
                  (unsigned long)pid);
   }
-  if (g_path_status[0] == L'\0' && GetTempPathW(1024, tmp) > 0) {
-    _snwprintf_s(g_path_status, 1024, _TRUNCATE,
-                 L"%sBiFlow\\hook_status_%lu.txt", tmp, (unsigned long)pid);
+  if (g_path_status[0] == L'\0') {
+    DWORD tmp_len = GetTempPathW(1024, tmp);
+    if (tmp_len > 0 && tmp_len < 1024) {
+      _snwprintf_s(g_path_status, 1024, _TRUNCATE,
+                   L"%sBiFlow\\hook_status_%lu.txt", tmp, (unsigned long)pid);
+    }
   }
 }
 
-// Fingerprint of all policy files (last-write times + sizes). 0 when
-// none exist.
-// Cheap: one GetFileAttributesExW per policy file.
+static int read_small_file(const wchar_t *path, char *buf, int buf_size);
+
+// Fingerprint of all policy files (last-write times + sizes + content
+// hash). 0 when none exist.
+// Cheap: one GetFileAttributesExW per policy file plus a small read —
+// the policy files are tiny, and change detection runs at most once
+// per 250 ms.
 static uint64_t policy_files_tick(void) {
   const wchar_t *paths[2] = {g_path_target_pd, g_path_apps_pd};
   uint64_t tick = 0;
@@ -205,6 +217,23 @@ static uint64_t policy_files_tick(void) {
                     (uint64_t)fad.nFileSizeLow;
       tick ^= (sz + 0x100ULL) + 0x9e3779b97f4a7c15ULL + (tick << 6) +
               (tick >> 2);
+      // Mix a hash of the CONTENT in too: a same-size rewrite inside
+      // the same FILETIME tick (e.g. one same-length target IP swapped
+      // for another) changes neither mtime nor size and would
+      // otherwise leave this process bound to the stale address
+      // (round-2 audit). FNV-1a over the bytes.
+      static char cbuf[64 * 1024];
+      int n = read_small_file(paths[i], cbuf, (int)sizeof(cbuf));
+      uint64_t h = 1469598103934665603ULL;
+      if (n < 0) {
+        h ^= 0xdeadbeefULL;
+      } else {
+        for (int k = 0; k < n; k++) {
+          h ^= (uint64_t)(unsigned char)cbuf[k];
+          h *= 1099511628211ULL;
+        }
+      }
+      tick ^= h + 0x9e3779b97f4a7c15ULL + (tick << 6) + (tick >> 2);
     }
   }
   return tick;
