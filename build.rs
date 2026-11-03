@@ -68,6 +68,10 @@ fn main() {
     cmd.args([
         "/LD",
         "/O2",
+        // Control Flow Guard, explicit instead of linker-default: this
+        // DLL is injected into dozens of foreign processes, so its
+        // exploit-mitigation surface must be deliberate (round-2 audit).
+        "/guard:cf",
         // Static CRT: the DLL is injected into arbitrary processes and must
         // not depend on a vcruntime140.dll being loadable in their context.
         "/MT",
@@ -84,6 +88,8 @@ fn main() {
         "/Icpp/minhook/src",
         "ws2_32.lib",
         "user32.lib",
+        "/link",
+        "/GUARD:CF",
     ]);
     match cmd.output() {
         Ok(out) if out.status.success() => {
