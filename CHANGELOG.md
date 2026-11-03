@@ -2,8 +2,8 @@
 
 ## v0.3.4 — 2026-11-03
 
-Fix wave from the round-2 granular audit of v0.3.3 (48 new findings:
-0 Critical / 2 High / 18 Medium / 27 Low / 1 Info). The audit also
+Fix wave from the round-2 granular audit of v0.3.3 (46 new findings:
+0 Critical / 2 High / 18 Medium / 25 Low / 1 Info). The audit also
 re-verified every v0.3.3 fix claim: 33 of 37 fully verified, none
 missing or fake — the three caveats were defects in the v0.3.3 fix wave
 itself, and all three are fixed here.
@@ -33,6 +33,14 @@ Correctness (engine):
 - The per-app status cache no longer rescans all processes per app
   or allocates a fresh lowercase string per (network PID × app):
   paths are lowercased once per refresh and indexed by path.
+- The watchdog thread is supervised and its sampling is fail-soft:
+  it publishes a heartbeat every cycle and the UI tick respawns it
+  after 45 s without one (a panic in the cycle used to kill all
+  enforcement silently), and a failed adapter enumeration now reuses
+  the last good list instead of reading as "adapter lost" (two empty
+  samples could trip the fail-close on a healthy adapter). Profile
+  applies whose counts were discarded at four call sites now log
+  their failures with the calling context.
 
 UI honesty and interaction:
 - Custom-app removal is now confirmed and fully wired: it stops the
