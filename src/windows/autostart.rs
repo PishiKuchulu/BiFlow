@@ -7,34 +7,114 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APP_NAME: &str = "BiFlow";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-fn task_exists() -> bool {
+/// Tri-state task query: Ok(true/false) is a real answer from schtasks;
+/// Err means the query itself failed, which callers must not flatten
+/// into "task absent" (an unverifiable removal is a failed removal).
+fn task_query() -> Result<bool, String> {
     // Absolute System32 path: an elevated process must never resolve
     // system tools by bare name (the executable's own folder is searched
     // before System32).
     let task_check = Command::new(crate::windows::system_tool("schtasks.exe"))
         .args(["/Query", "/TN", APP_NAME])
         .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    matches!(task_check, Ok(out) if out.status.success())
+        .output()
+        .map_err(|e| format!("Failed to run schtasks: {}", e))?;
+    Ok(task_check.status.success())
 }
 
-/// True when the executable lives under a location that standard users
-/// cannot write to (Program Files / ProgramData roots). The logon task
-/// runs the executable with HighestAvailable, so registering it from a
-/// user-writable folder (a portable copy in Downloads, say) would let any
-/// same-user process replace the binary and have its code run at the next
-/// logon with the full administrator token.
+fn task_exists() -> bool {
+    matches!(task_query(), Ok(true))
+}
+
+/// The current user's SID string, read from the process token. The
+/// autostart XML and the protected-location check both need the user's
+/// real identity; environment variables (USERDOMAIN/USERNAME) are
+/// inherited, spoofable text and are not an identity source.
+fn current_user_sid_string() -> Option<String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut len: u32 = 0;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+        if len == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            len,
+            &mut len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_str: windows_sys::core::PWSTR = null_mut();
+        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid_str) == 0 || sid_str.is_null() {
+            return None;
+        }
+        let mut n = 0usize;
+        while *sid_str.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, n));
+        LocalFree(sid_str as HLOCAL);
+        Some(s)
+    }
+}
+
+/// True when the executable lives somewhere a standard user cannot
+/// replace it: under a Program Files / ProgramData root (checked on the
+/// canonicalized path, so junction tricks do not slip past) AND with a
+/// directory DACL that grants no write-like rights to untrusted
+/// principals. The prefix test alone is NOT sufficient — the default
+/// %ProgramData% ACL lets any user create a subfolder there, and that
+/// subfolder is fully writable by its creator while passing a prefix
+/// test. The logon task runs the executable with HighestAvailable, so
+/// registering it from a user-writable folder would let any same-user
+/// process replace the binary and have its code run at the next logon
+/// with the full administrator token.
 fn exe_dir_is_protected(exe: &std::path::Path) -> bool {
-    let exe_str = exe.to_string_lossy().to_ascii_lowercase();
+    let Some(user_sid) = current_user_sid_string() else {
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(exe) else {
+        return false;
+    };
+    let exe_str = canonical.to_string_lossy().to_ascii_lowercase();
+    let exe_str = exe_str.strip_prefix(r"\\?\").unwrap_or(&exe_str);
+    let mut under_root = false;
     for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
         if let Ok(root) = env::var(var) {
             let root = root.trim_end_matches('\\').to_ascii_lowercase();
             if !root.is_empty() && exe_str.starts_with(&format!("{}\\", root)) {
-                return true;
+                under_root = true;
+                break;
             }
         }
     }
-    false
+    if !under_root {
+        return false;
+    }
+    let Some(dir) = canonical.parent() else {
+        return false;
+    };
+    // Fail closed on an unreadable DACL.
+    matches!(
+        crate::windows::injector::path_grants_untrusted_write(dir, &user_sid),
+        Some(false)
+    )
 }
 
 fn run_key_present() -> bool {
@@ -66,22 +146,19 @@ fn xml_escape(s: &str) -> String {
 /// - starts BiFlow minimized to the tray via the --minimized argument,
 /// - registers ONLY the task: keeping the legacy HKCU Run entry as a second
 ///   mechanism could start two instances racing over the policy files.
-fn task_xml(exe: &std::path::Path) -> String {
-    let user = match (env::var("USERDOMAIN"), env::var("USERNAME")) {
-        (Ok(domain), Ok(name)) if !name.is_empty() => format!("{}\\{}", domain, name),
-        (_, Ok(name)) if !name.is_empty() => name,
-        _ => String::new(),
-    };
-    let user_id = if user.is_empty() {
-        String::new()
-    } else {
-        format!("<UserId>{}</UserId>", xml_escape(&user))
-    };
+fn task_xml(exe: &std::path::Path) -> Result<String, String> {
+    // The principal is the current user's SID from the process token,
+    // never environment text. If the SID cannot be determined the task
+    // must not be registered at all: omitting <UserId> would silently
+    // widen the logon trigger to EVERY user of the machine.
+    let sid = current_user_sid_string()
+        .ok_or_else(|| "Could not determine the current user's SID".to_string())?;
+    let user_id = format!("<UserId>{}</UserId>", xml_escape(&sid));
     let workdir = exe
         .parent()
         .map(|p| xml_escape(&p.to_string_lossy()))
         .unwrap_or_default();
-    format!(
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -120,7 +197,7 @@ fn task_xml(exe: &std::path::Path) -> String {
         user_id = user_id,
         exe = xml_escape(&exe.to_string_lossy()),
         workdir = workdir,
-    )
+    ))
 }
 
 fn remove_run_key() {
@@ -162,14 +239,21 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
         let xml_dir = crate::windows::injector::biflow_programdata_dir()
             .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?;
         let xml_path = xml_dir.join("biflow_autostart_task.xml");
-        // schtasks /XML expects a UTF-16LE file.
-        let xml = task_xml(&exe);
+        // schtasks /XML expects a UTF-16LE file. It is published via a
+        // temp file + rename so a crash mid-write cannot leave a torn
+        // XML (containing the exe path and the user's SID) behind.
+        let xml = task_xml(&exe)?;
         let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
         for unit in xml.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        std::fs::write(&xml_path, &bytes)
+        let xml_tmp = xml_dir.join("biflow_autostart_task.xml.tmp");
+        std::fs::write(&xml_tmp, &bytes)
             .map_err(|e| format!("Failed to write autostart task XML: {}", e))?;
+        if let Err(e) = std::fs::rename(&xml_tmp, &xml_path) {
+            let _ = std::fs::remove_file(&xml_tmp);
+            return Err(format!("Failed to publish autostart task XML: {}", e));
+        }
         // The XML defines an elevated task; prove its protection instead of
         // relying on whatever the folder happened to inherit.
         if let Err(e) = crate::windows::injector::apply_protected_acl(&xml_path) {
@@ -215,12 +299,28 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
     } else {
         delete_task();
         remove_run_key();
-        // Verify the task is really gone: previously the delete result was
-        // ignored and the UI reported "disabled" while the task (and its
-        // elevated logon run) stayed registered.
-        if task_exists() {
+        // Verify BOTH mechanisms are really gone, with a strict query:
+        // previously the delete result was ignored and the UI reported
+        // "disabled" while the task (and its elevated logon run) stayed
+        // registered, and a surviving Run-key entry would have been
+        // missed entirely because only the task side was checked.
+        match task_query() {
+            Ok(true) => {
+                return Err(
+                    "The BiFlow logon task could not be removed (it is still registered).".into(),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(format!(
+                    "Could not verify that the BiFlow logon task was removed: {}",
+                    e
+                ));
+            }
+        }
+        if run_key_present() {
             return Err(
-                "The BiFlow logon task could not be removed (it is still registered).".into(),
+                "The BiFlow Run-key entry could not be removed (it is still present).".into(),
             );
         }
         Ok(())
