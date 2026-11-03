@@ -5,11 +5,10 @@ use std::{
 };
 use uuid::Uuid;
 
-pub type ProcessMaps = (
-    HashMap<String, Vec<u32>>,
-    HashMap<u32, u32>,
-    HashMap<u32, String>,
-);
+/// One definition of the process-map shape for the whole crate (the
+/// injector produces it, the watchdog consumes it). It used to be
+/// re-declared here as a second, identical tuple type.
+pub type ProcessMaps = injector::ProcessMaps;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -81,6 +80,11 @@ pub struct EnforcementManager {
     /// helper appeared, a helper exited) instead of rewriting the policy
     /// files every cycle.
     published_allow: HashSet<String>,
+    /// The most recent policy-publish failure, cleared by the next
+    /// successful publish. Surfaced through live_status_map so the UI can
+    /// warn that on-disk policy may be a stale generation instead of
+    /// deriving "Live" from in-memory bookkeeping alone.
+    last_policy_error: Option<String>,
 }
 
 impl EnforcementManager {
@@ -90,9 +94,14 @@ impl EnforcementManager {
     /// interprets as "bypass disabled". Failures are returned: a caller
     /// must never treat a bypass as live when its policy was not published.
     fn sync_policy_files(&mut self) -> Result<(), String> {
-        match &self.target_ip {
+        let result: Result<(), String> = match &self.target_ip {
             Some(ip) if !self.active.is_empty() => {
-                injector::update_target_ip(ip)?;
+                // Publish the allow-list FIRST and the target IP second:
+                // during the intermediate state (new list, previous or
+                // absent IP file) the hook either binds to the previous
+                // generation's address or stays off, whereas IP-first
+                // would pair the NEW address with the PREVIOUS allow-list
+                // generation for the window between the two renames.
                 // The allow-list is every path the hook must bypass: each
                 // app's own executable PLUS the helper/descendant paths the
                 // watchdog injected for it. A hooked process whose path is
@@ -107,6 +116,7 @@ impl EnforcementManager {
                 let mut paths: Vec<String> = set.iter().cloned().collect();
                 paths.sort();
                 injector::update_bypass_app_list(&paths)?;
+                injector::update_target_ip(ip)?;
                 self.published_allow = set.iter().map(|s| s.to_ascii_lowercase()).collect();
                 Ok(())
             }
@@ -115,7 +125,15 @@ impl EnforcementManager {
                 self.published_allow.clear();
                 Ok(())
             }
+        };
+        // A failed publish is remembered until the next successful one:
+        // the UI's "Live" derivation otherwise has no way to know the
+        // on-disk policy may be a stale generation.
+        match &result {
+            Ok(()) => self.last_policy_error = None,
+            Err(e) => self.last_policy_error = Some(e.clone()),
         }
+        result
     }
 
     pub fn apply(
@@ -146,13 +164,19 @@ impl EnforcementManager {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // An empty exe name used to insert a permanently-Failed entry
+        // whose path still landed on the published allow-list. Refuse
+        // before mutating any state instead.
+        if exe_name.is_empty() {
+            return Err("Executable path has no file name".into());
+        }
+        self.adapter_missing_cycles = 0;
+
         let mut injected_pids: HashMap<u32, u64> = HashMap::new();
         let mut awaiting_process = false;
         let mut inject_error: Option<String> = None;
 
-        if exe_name.is_empty() {
-            inject_error = Some("Empty executable name".into());
-        } else {
+        {
             // Match by full executable path so same-name binaries in other
             // folders are never injected by accident.
             let pids = injector::find_pids_by_exe_path(&exe);
@@ -173,6 +197,17 @@ impl EnforcementManager {
                 }
                 if injected_pids.is_empty() {
                     inject_error = last_err.or_else(|| Some("DLL injection failed".into()));
+                } else if let Some(e) = &last_err {
+                    // Partial injection is real information: some PIDs of
+                    // this app are hooked, others are not. It used to
+                    // vanish (only total failure was recorded anywhere).
+                    config::append_log(&format!(
+                        "INJECT_PARTIAL app={} exe={} ok={} err={}",
+                        app_id,
+                        exe.display(),
+                        injected_pids.len(),
+                        e
+                    ));
                 }
             }
         }
@@ -243,6 +278,10 @@ impl EnforcementManager {
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
+        if exe_name.is_empty() {
+            return Err("Executable path has no file name".into());
+        }
+        self.adapter_missing_cycles = 0;
 
         // Register the bypass and publish the policy files BEFORE the
         // process starts, so the hook DLL finds the allow-list (including
@@ -319,6 +358,7 @@ impl EnforcementManager {
     }
 
     pub fn remove(&mut self, app_id: Uuid) -> Result<(), String> {
+        self.adapter_missing_cycles = 0;
         let removed = self.active.remove(&app_id);
         let removed_name = removed.as_ref().map(|e| e.exe_name.clone());
         let prev_ip = self.target_ip.clone();
@@ -345,6 +385,7 @@ impl EnforcementManager {
     }
 
     pub fn clear_all(&mut self) -> Result<(), String> {
+        self.adapter_missing_cycles = 0;
         let prev_active = std::mem::take(&mut self.active);
         let prev_ip = self.target_ip.take();
         if let Err(e) = self.sync_policy_files() {
@@ -365,15 +406,19 @@ impl EnforcementManager {
     /// the hook DLL is actually injected into a live process and the DLL
     /// confirmed its hooks are installed.
     pub fn live_status(&self, app_id: Uuid) -> Option<BypassLiveStatus> {
-        self.active.get(&app_id).map(|b| {
-            if !b.injected_pids.is_empty() {
-                BypassLiveStatus::Live
-            } else if b.awaiting_process {
-                BypassLiveStatus::Pending
-            } else {
-                BypassLiveStatus::Failed
-            }
-        })
+        self.active.get(&app_id).map(Self::derive_live_status)
+    }
+
+    /// The single derivation of live status from an entry (live_status
+    /// and live_status_map used to carry verbatim copies of this logic).
+    fn derive_live_status(b: &ActiveBypass) -> BypassLiveStatus {
+        if !b.injected_pids.is_empty() {
+            BypassLiveStatus::Live
+        } else if b.awaiting_process {
+            BypassLiveStatus::Pending
+        } else {
+            BypassLiveStatus::Failed
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -390,7 +435,14 @@ impl EnforcementManager {
         snapshot: &WatchdogSnapshot,
         maps: &ProcessMaps,
     ) -> Vec<WatchdogPlanEntry> {
-        let (_names, parents, paths) = maps;
+        let (parents, paths) = maps;
+        // Lowercase every path ONCE per plan: the filters below used to
+        // allocate a fresh lowercase String per process per bypassed app
+        // (O(apps × processes) short-lived strings per watchdog cycle).
+        let lower_paths: HashMap<u32, String> = paths
+            .iter()
+            .map(|(pid, p)| (*pid, p.to_ascii_lowercase()))
+            .collect();
         let mut out = Vec::new();
         for bypass in &snapshot.entries {
             if bypass.exe_name.is_empty() {
@@ -403,9 +455,9 @@ impl EnforcementManager {
                 .map(|p| p.to_string_lossy().to_ascii_lowercase());
 
             // Primary processes: exact exe path match.
-            let mut current: HashSet<u32> = paths
+            let mut current: HashSet<u32> = lower_paths
                 .iter()
-                .filter(|(_, p)| p.to_ascii_lowercase() == target)
+                .filter(|(_, p)| **p == target)
                 .map(|(pid, _)| *pid)
                 .collect();
 
@@ -414,10 +466,22 @@ impl EnforcementManager {
             let mut helper_paths: Vec<String> = Vec::new();
             if let Some(dir) = &app_dir {
                 let prefix = format!("{}\\", dir.trim_end_matches('\\'));
-                let descendants: Vec<u32> = paths
+                // Breadth guard: when the install dir is itself a
+                // near-root folder (e.g. the exe sits directly in
+                // "C:\Program Files" or "D:\"), the prefix matches a huge
+                // unrelated tree, so descendants must live in a
+                // SUBdirectory of it, not directly inside it.
+                let shallow_dir = dir.matches('\\').count() <= 1;
+                let descendants: Vec<u32> = lower_paths
                     .iter()
                     .filter(|(pid, p)| {
-                        !current.contains(pid) && p.to_ascii_lowercase().starts_with(&prefix)
+                        if current.contains(pid) || !p.starts_with(&prefix) {
+                            return false;
+                        }
+                        if shallow_dir && !p[prefix.len()..].contains('\\') {
+                            return false;
+                        }
+                        true
                     })
                     .map(|(pid, _)| *pid)
                     .filter(|pid| {
@@ -518,9 +582,20 @@ impl EnforcementManager {
             None => {
                 self.adapter_missing_cycles += 1;
                 if self.adapter_missing_cycles >= 2 {
-                    config::append_log("ADAPTER_LOST policy fail-closed");
                     self.target_ip = None;
-                    let _ = self.sync_policy_files();
+                    // The fail-close is only real once the policy files
+                    // are actually deleted. A failed deletion used to be
+                    // discarded silently while the entries were marked
+                    // Failed anyway — the hooks kept binding to the stale
+                    // address behind a UI that said "suspended". On
+                    // failure: log it and keep the bookkeeping truthful
+                    // (injected PIDs stay recorded); the branch re-enters
+                    // next cycle and retries the deletion.
+                    if let Err(e) = self.sync_policy_files() {
+                        config::append_log(&format!("ADAPTER_LOST_POLICY_DELETE_FAILED {}", e));
+                        return;
+                    }
+                    config::append_log("ADAPTER_LOST policy fail-closed");
                     for bypass in self.active.values_mut() {
                         bypass.injected_pids.clear();
                         bypass.awaiting_process = false;
@@ -582,19 +657,27 @@ impl EnforcementManager {
     }
 
     /// One-shot status map for the UI: a single lock for a whole frame
-    /// instead of two locks per rendered row.
-    pub fn live_status_map(&self) -> HashMap<Uuid, (BypassLiveStatus, Option<String>)> {
+    /// instead of two locks per rendered row. The value carries the live
+    /// status, a displayable problem text (the entry's injection error,
+    /// or a manager-wide policy-publish problem when there is one), and
+    /// the helper-process paths currently bypassed for the app — which
+    /// used to widen the bypass invisibly, with no UI surface at all.
+    pub fn live_status_map(
+        &self,
+    ) -> HashMap<Uuid, (BypassLiveStatus, Option<String>, Vec<String>)> {
         self.active
             .iter()
             .map(|(id, b)| {
-                let status = if !b.injected_pids.is_empty() {
-                    BypassLiveStatus::Live
-                } else if b.awaiting_process {
-                    BypassLiveStatus::Pending
-                } else {
-                    BypassLiveStatus::Failed
+                let status = Self::derive_live_status(b);
+                let problem = match (&b.inject_error, &self.last_policy_error) {
+                    (Some(e), Some(p)) => Some(format!("{}\nPolicy sync problem: {}", e, p)),
+                    (Some(e), None) => Some(e.clone()),
+                    (None, Some(p)) => Some(format!("Policy sync problem: {}", p)),
+                    (None, None) => None,
                 };
-                (*id, (status, b.inject_error.clone()))
+                let mut helpers: Vec<String> = b.helper_paths.iter().cloned().collect();
+                helpers.sort();
+                (*id, (status, problem, helpers))
             })
             .collect()
     }
