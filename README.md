@@ -1,34 +1,19 @@
-# ⚡ BiFlow
+# ⚡ BiFlow / بای‌فلو
 
-<p align="center">
-  <img src="assets/icon_256.png" alt="BiFlow Logo" width="130" style="border-radius: 20px;" />
-</p>
-
-<p align="center">
-  <strong>Portable Windows Per-Application Split Routing & Network Isolation Engine</strong>
-</p>
-
-<p align="center">
-  <a href="README.md">English</a> • <a href="README_FA.md">فارسی</a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/PishiKuchulu/BiFlow/actions/workflows/build-release.yml"><img src="https://img.shields.io/github/actions/workflow/status/PishiKuchulu/BiFlow/build-release.yml?branch=main&style=flat-square&logo=github&label=Build" alt="CI Status" /></a>
-  <a href="https://github.com/PishiKuchulu/BiFlow/releases"><img src="https://img.shields.io/github/v/release/PishiKuchulu/BiFlow?style=flat-square&color=38bdf8" alt="Release" /></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(x64)-blue?style=flat-square&logo=windows" alt="Platform" />
-  <img src="https://img.shields.io/badge/Language-Rust%20%7C%20Win32%20C-orange?style=flat-square&logo=rust" alt="Rust" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" /></a>
-</p>
+**Portable Windows Per-Application Split Routing & Network Isolation Engine**  
+**موتور مسیریابی تفکیک‌شده و ایزولاسیون شبکه برای هر برنامه در ویندوز (بدون نیاز به درایور)**
 
 ---
 
-## 📖 Overview
+## 🇬🇧 English
 
-When a VPN or proxy tunnel is active on Windows, all system traffic is typically encapsulated within the tunnel. **BiFlow** gives you fine-grained control over your network topology:
+When a VPN or proxy tunnel is active on Windows, all system traffic is typically encapsulated within the tunnel, killing your ping in games or slowing down local network tasks. **BiFlow** gives you absolute control over your network topology.
 
-It allows you to route designated applications **directly through your physical network adapter** (e.g. Wi-Fi or Ethernet), while keeping the rest of your operating system traffic protected inside the VPN tunnel.
+It allows you to route designated applications (like Steam, Games, or Torrent clients) **directly through your physical network adapter** (Wi-Fi/Ethernet), while keeping the rest of your operating system traffic protected inside the encrypted VPN tunnel.
 
-```
+### 🌐 The BiFlow Architecture
+
+```text
                            ┌───────────────────────────────┐
                            │      Windows Workstation      │
                            └───────────────┬───────────────┘
@@ -50,126 +35,68 @@ It allows you to route designated applications **directly through your physical 
        └───────────────────┘                              └─────────────────────┘
 ```
 
----
+### ✨ Key Features
 
-## ✨ Key Features
+* 🚀 **100% Driverless & Portable:** No virtual network adapter drivers (TAP/TUN), no WinDivert drivers, and no kernel code at all — so there is no driver that could cause a Blue Screen (BSOD). Runs as a single portable standalone executable (`BiFlow.exe`).
+* ⚡ **Native Winsock Interception:** Intercepts client socket operations at the native Windows Sockets layer (`bind`, `connect`, `WSAConnect`, `sendto`, `WSASendTo`) using an embedded high-performance hook DLL.
+* 🌐 **Native Hardware Discovery:** Network adapters and gateways are enumerated directly through the native Win32 `GetAdaptersAddresses` API — no PowerShell or WMI delays.
+* 📊 **Open-Connection Telemetry:** Live snapshot of running GUI applications and their open IPv4/IPv6 connections (a socket snapshot, not a traffic meter).
+* 🛡️ **One-Click Block:** Instantly cut any application off from new connections using native Windows Defender Firewall rules (both directions, verified after creation), and terminate its existing IPv4 TCP connections on the spot via `SetTcpEntry`. Existing IPv6 connections end on their own; new ones are blocked.
+* 🎮 **Direct Launch Mode:** Launch games and applications directly from BiFlow with the bypass hook pre-injected *before* the application makes its first network call.
+* 📋 **Smart Profiles:** Save rule sets (Gaming, Streaming, Work) and switch between them with one click. The Direct adapter choice is global and kept separate from profiles.
+* 🗕 **System Tray Integration:** Docks into the Windows notification area with background watchdog monitoring.
+* 🔒 **UAC-Safe Autostart:** Starts automatically at Windows logon via Task Scheduler with Administrator privileges and no UAC prompts — provided `BiFlow.exe` lives in a protected location (e.g. Program Files), which BiFlow verifies before registering the task.
 
-- **🚀 100% Driverless & Portable:** No virtual network adapter drivers (TAP/TUN), no WinDivert drivers, and no risk of Blue Screens (BSOD). Runs as a single portable standalone executable (`BiFlow.exe`).
-- **⚡ Winsock Socket Interception:** Intercepts client socket operations at the native Windows Sockets layer (`connect`, `WSAConnect`, `sendto`, and `bind` for `ConnectEx`) using an embedded high-performance hook DLL.
-- **🌐 0ms Win32 Hardware Discovery:** Blazing-fast discovery of network adapters, gateways, and connection statuses via Win32 `GetAdaptersAddresses` API with zero PowerShell or WMI delays.
-- **📊 Real-time Network Telemetry:** Live detection of running GUI applications and processes actively exchanging packets over IPv4/IPv6 using extended TCP/UDP MIB tables.
-- **🛡️ One-Click Internet Kill-Switch:** Instantly isolate any application from the internet using native Windows Defender Firewall rules and sever existing TCP connections on the spot via `SetTcpEntry`.
-- **🚀 Direct Launch Mode:** Launch games and applications directly from BiFlow with the bypass hook pre-injected before the application makes its first network call.
-- **📋 Smart Profiles:** Save configurations (Default, Gaming, Streaming, Work) with per-profile adapter selections, live rule modification detection, and one-click revert.
-- **🗕 System Tray Integration:** Docks into the Windows notification area with background watchdog monitoring, minimize-to-tray, and an instant-restore context menu.
-- **🔒 UAC-Safe Elevated Autostart:** Seamless integration with Windows Task Scheduler (`schtasks`) to ensure automatic startup with Administrator privileges without being silenced by Windows UAC.
+### 📲 Download & Usage
 
----
+1. Go to the [Releases](https://github.com/PishiKuchulu/BiFlow/releases) page.
+2. Download the latest `BiFlow-Portable-Windows-x64.zip` (or the standalone `BiFlow.exe`).
+3. Extract it anywhere on your PC and run `BiFlow.exe` as Administrator.
+4. Select the apps you want to bypass the VPN and enjoy the direct connection!
 
-## 🚀 Quick Start
+Optional: verify your download against the `SHA256SUMS.txt` published with each release.
 
-### 1. Download
-Download the latest standalone executable from [Releases](https://github.com/PishiKuchulu/BiFlow/releases):
-- `BiFlow.exe` (Single Portable Binary)
-- `BiFlow-Portable-Windows-x64.zip` (Portable Archive)
+### 📚 Documentation
 
-### 2. Usage
-1. Connect your VPN client (WireGuard, OpenVPN, v2ray, Sing-box, Tailscale, Clash, etc.).
-2. Launch **`BiFlow.exe`** (Run as Administrator to allow firewall management and cross-process injection).
-3. Under the **🌐 Network Adapters** tab, verify that your physical network adapter (Wi-Fi or Ethernet) is selected.
-4. Under the **📱 Applications** tab, find your application (or click **Browse `.exe`** to add any portable program).
-5. Click **⚡ Enable Direct Bypass** or **🚀 Launch Direct**.
-6. That's it! Your selected application now communicates directly over your physical network adapter.
+* [Architecture](docs/ARCHITECTURE.md) • [Networking](docs/NETWORKING.md) • [Security model](docs/SECURITY.md) • [Known limitations](docs/LIMITATIONS.md)
+* Note: the bypass core targets IPv4; see the limitations document for the exact scope.
+* License: MIT — see [LICENSE](LICENSE).
 
 ---
 
-## 🛠️ Architecture & Under the Hood
+## 🇮🇷 فارسی
 
-BiFlow achieves reliable, driver-free per-process split-routing through a multi-tiered architecture:
+وقتی یک VPN یا پروکسی در ویندوز روشن است، معمولاً تمام ترافیک سیستم از داخل تونل عبور می‌کند؛ اتفاقی که باعث افزایش پینگ در بازی‌ها یا کندی کارهای شبکه محلی می‌شود. **بای‌فلو (BiFlow)** کنترل کامل توپولوژی شبکه را به شما برمی‌گرداند.
 
-| Component | Technology | Responsibility |
-| :--- | :--- | :--- |
-| **Frontend UI** | Rust 2021 + `egui` / `eframe` | Clean dark-mode UI, reactive state management, profile persistence |
-| **Adapter Telemetry** | Win32 `IP Helper` API | Querying interface table, identifying virtual/VPN adapters |
-| **Connection Monitor** | Win32 `MIB_TCPTABLE` / `UDPTABLE` | Identifying PIDs with open sockets and tearing down blocked TCP streams |
-| **Injection Engine** | Win32 Toolhelp + `CreateRemoteThread` | Safe injection of 64-bit hook DLL into target process address space |
-| **Hook Core** | Native C + `MinHook` | Intercepting `ws2_32.dll` to bind outbound client sockets to physical adapter IP |
-| **Firewall Engine** | Windows Defender Firewall | Inbound & Outbound block rules with fallback to PowerShell NetSecurity |
-| **Scheduler** | Windows Task Scheduler (`schtasks`) | Highest-privilege execution on Windows user logon |
+این برنامه به شما اجازه می‌دهد ترافیک برنامه‌های خاص (مثل استیم، بازی‌های آنلاین یا نرم‌افزارهای دانلود تورنت) را **مستقیماً از طریق کارت شبکه فیزیکی** (وای‌فای یا کابل LAN) عبور دهید، در حالی که ترافیک سایر بخش‌های ویندوز به صورت امن و رمزنگاری‌شده در تونل VPN باقی می‌ماند.
 
----
+### ✨ ویژگی‌های کلیدی
 
-## 🔨 Building from Source
+* 🚀 **۱۰۰٪ پرتابل و بدون درایور:** برخلاف ابزارهای مشابه، نیازی به نصب درایورهای مجازی (TAP/TUN) یا WinDivert ندارد و هیچ کد سطح کرنلی اجرا نمی‌کند؛ پس درایوری وجود ندارد که باعث صفحه آبی مرگ (BSOD) شود. فقط یک فایل اجرایی (`BiFlow.exe`) است!
+* ⚡ **هوک سطح پایین Winsock:** عملیات سوکت را در لایه بومی ویندوز (`bind`، `connect`، `WSAConnect`، `sendto`، `WSASendTo`) با استفاده از یک DLL سریع رهگیری و مسیریابی می‌کند.
+* 🌐 **شناسایی بومی سخت‌افزار:** آداپتورهای شبکه و گیت‌وی‌ها مستقیماً از طریق API بومی Win32 یعنی `GetAdaptersAddresses` خوانده می‌شوند؛ بدون اسکریپت‌های کند PowerShell و WMI.
+* 📊 **تله‌متری کانکشن‌های باز:** نمای لحظه‌ای از برنامه‌های در حال اجرا و کانکشن‌های باز IPv4/IPv6 آن‌ها (نمای سوکت‌های باز است، نه شمارندهٔ ترافیک).
+* 🛡️ **قطع فوری با یک کلیک:** همهٔ کانکشن‌های جدید هر برنامه را در هر دو جهت با فایروال خودِ ویندوز Defender ببندید (قانون‌ها بعد از ساخت راستی‌آزمایی می‌شوند) و کانکشن‌های TCP موجود IPv4 آن را بلافاصله با `SetTcpEntry` خاتمه دهید. کانکشن‌های IPv6 موجود خودشان پایان می‌یابند و کانکشن جدیدشان بلاک است.
+* 🎮 **حالت Direct Launch:** بازی‌ها را مستقیماً از داخل BiFlow اجرا کنید تا هوکِ بای‌پس **قبل از اولین درخواست شبکه** به پروسس بازی تزریق شود.
+* 📋 **پروفایل‌های هوشمند:** مجموعه‌قانون‌های مختلف (گیمینگ، استریم، کار) را ذخیره کنید و با یک کلیک بین آن‌ها جابه‌جا شوید. انتخاب آداپتور مستقیم سراسری است و جدا از پروفایل‌ها نگه داشته می‌شود.
+* 🗕 **حضور در System Tray:** اجرای آرام در پس‌زمینه و نظارت مداوم (Watchdog) روی وضعیت شبکه.
+* 🔒 **اجرای خودکار بدون دردسر UAC:** اجرای خودکار هنگام ورود به ویندوز (Logon) با Task Scheduler و دسترسی ادمین، بدون نمایش پنجره‌های آزاردهنده UAC — به این شرط که فایل `BiFlow.exe` در یک مکان محافظت‌شده (مثل Program Files) باشد؛ BiFlow این شرط را پیش از ثبت تسک بررسی می‌کند.
 
-### Prerequisites
-- **Operating System:** Windows 10 or Windows 11 (64-bit)
-- **Rust Toolchain:** Stable MSVC toolchain (`x86_64-pc-windows-msvc`)
-- **C++ Build Tools:** Visual Studio C++ Build Tools or MSVC compiler (`cl.exe`)
+### 📲 دانلود و استفاده
 
-### Quick Build
-Clone the repository:
-```powershell
-git clone https://github.com/PishiKuchulu/BiFlow.git
-cd BiFlow
-```
+۱. به بخش [Releases](https://github.com/PishiKuchulu/BiFlow/releases) در همین صفحه بروید.
+۲. آخرین نسخهٔ `BiFlow-Portable-Windows-x64.zip` (یا فایل تکی `BiFlow.exe`) را دانلود کنید.
+۳. فایل را در هر جایی از سیستم Extract کرده و `BiFlow.exe` را با دسترسی Administrator اجرا کنید.
+۴. برنامه‌هایی که می‌خواهید از VPN رد شوند (Bypass) را انتخاب کنید و از سرعت کامل اینترنت لذت ببرید!
 
-Compile release binary:
-```powershell
-cargo build --release
-```
+اختیاری: دانلودتان را با فایل `SHA256SUMS.txt` که همراه هر ریلیز منتشر می‌شود تطبیق دهید.
 
-Or run the automated release builder script:
-```powershell
-.\scripts\build-release.ps1
-```
+### 📚 مستندات
 
-The resulting standalone executable will be created at:
-```
-BiFlow.exe
-```
+* [معماری](docs/ARCHITECTURE.md) • [شبکه](docs/NETWORKING.md) • [مدل امنیتی](docs/SECURITY.md) • [محدودیت‌های شناخته‌شده](docs/LIMITATIONS.md)
+* توجه: هستهٔ بای‌پس IPv4 را هدف می‌گیرد؛ دامنهٔ دقیق در سند محدودیت‌ها آمده است.
+* مجوز: MIT — فایل [LICENSE](LICENSE) را ببینید.
 
 ---
 
-## ⚠️ Honest Limitations
-
-- **IPv4 only:** the bypass hook covers IPv4 sockets (`connect`, `WSAConnect`, `sendto`, `WSASendTo`, `bind`). IPv6 traffic of a bypassed app still follows the system/VPN route.
-- **New connections only:** enabling, disabling, or switching a bypass affects *new* sockets. Already-established connections are never migrated — restart the app for a fully clean state.
-- **Chromium browsers:** "Launch Direct" on Chrome/Edge/Brave adds `--disable-features=RendererCodeIntegrity --no-proxy-server` (required for the hook to load). This weakens the browser sandbox's code-integrity check for that instance.
-- **64-bit only:** 32-bit (WOW64) processes are detected and skipped.
-- A VPN kill-switch that blocks direct egress will still block bypassed traffic — BiFlow does not circumvent it. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
-
----
-
-## 🛡️ Safety Warnings
-
-- **Not code-signed:** Windows SmartScreen will warn on first run, and some antivirus products may flag BiFlow heuristically — its core technique (DLL injection into other processes) resembles malware behavior. Download only from this repository's Releases and verify the SHA-256 checksums in `SHA256SUMS.txt`.
-- **Anti-cheat protected games:** never use BiFlow with games protected by Easy Anti-Cheat, BattlEye, Vanguard or similar systems. Injecting any DLL into such a game can get your account banned.
-- **Administrator rights:** BiFlow runs elevated. Apps started via "Launch Direct" are started *without* administrator rights whenever possible, and BiFlow warns in the status line when one had to be launched elevated.
-
----
-
-## 🧹 Uninstall / Cleanup
-
-BiFlow is portable — delete `BiFlow.exe` and you are almost done. For a full cleanup also remove:
-
-- `%ProgramData%\BiFlow` (hook DLL, policy files, autostart task XML)
-- `%LOCALAPPDATA%\BiFlow` (config + log) — or the `data` folder next to the exe in portable mode
-- any `BiFlow_Block_*` rules in Windows Defender Firewall (or unblock all apps in BiFlow before deleting it)
-- the `BiFlow` Scheduled Task if you enabled autostart (or disable autostart in Settings first)
-
----
-
-## 🤝 Contributing
-
-Contributions, bug reports, and feature suggestions are very welcome!
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-Distributed under the **MIT License**. See [LICENSE](LICENSE) for more information.
+**Developed with ❤️ by Farzad Sholeh**
