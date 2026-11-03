@@ -11,6 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
 
+/// One watchdog-computed snapshot for the UI: process maps, the set of
+/// PIDs with open connections (None when enumeration failed outright —
+/// the UI keeps its previous set rather than flickering every app to
+/// "offline"), and the adapter list.
+pub struct WatchdogCache {
+    pub process_parents: HashMap<u32, u32>,
+    pub pid_to_path: HashMap<u32, String>,
+    pub active_network_pids: Option<HashSet<u32>>,
+    pub interfaces: Vec<InterfaceInfo>,
+}
+
 pub struct AppState {
     pub store: Store,
     pub apps: Vec<AppEntry>,
@@ -25,6 +36,12 @@ pub struct AppState {
     pub manager: Arc<Mutex<EnforcementManager>>,
     /// Selected adapter index mirrored for the watchdog thread.
     pub watchdog_adapter: Arc<Mutex<Option<u32>>>,
+    /// Latest process/adapter snapshot computed BY the watchdog thread.
+    /// The UI tick consumes this instead of re-running the full process
+    /// map, four connection-table queries and adapter enumeration on the
+    /// UI thread every 1.5 s (the old tick froze the window on a loaded
+    /// machine).
+    pub watchdog_cache: Arc<Mutex<Option<WatchdogCache>>>,
     /// True when the config file existed but could not be read at startup;
     /// saving is then disabled so defaults never overwrite the real config.
     pub config_load_failed: bool,
@@ -59,7 +76,14 @@ impl AppState {
     /// locks per rendered row).
     pub fn live_status_map(
         &self,
-    ) -> HashMap<Uuid, (crate::enforcement::BypassLiveStatus, Option<String>)> {
+    ) -> HashMap<
+        Uuid,
+        (
+            crate::enforcement::BypassLiveStatus,
+            Option<String>,
+            Vec<String>,
+        ),
+    > {
         self.manager().live_status_map()
     }
 
@@ -102,6 +126,7 @@ impl AppState {
                 (Store::default(), true)
             }
         };
+        Self::sanitize_store(&mut store);
 
         // Sync autostart status with actual Windows registry
         let reg_autostart = autostart::is_autostart_enabled();
@@ -134,7 +159,16 @@ impl AppState {
             }
         }
 
-        let interfaces = network::interfaces().unwrap_or_default();
+        let interfaces = match network::interfaces() {
+            Ok(v) => v,
+            Err(e) => {
+                // "Enumeration failed" must not look like "no adapters":
+                // record it (the UI list will be empty either way, but
+                // the log keeps the two cases distinguishable).
+                config::append_log(&format!("ADAPTER_ENUM_FAILED {}", e));
+                Vec::new()
+            }
+        };
 
         // Choose the saved adapter (by stable GUID first, IfIndex second)
         // or the best physical direct interface.
@@ -154,10 +188,8 @@ impl AppState {
             }
         }
 
-        // The basename-keyed process map is intentionally discarded: all
-        // status decisions use full executable paths (see is_app_running).
-        let (_running_processes, process_parents, pid_to_path) = injector::get_process_maps();
-        let active_network_pids = network::get_active_network_pids();
+        let (process_parents, pid_to_path) = injector::get_process_maps();
+        let active_network_pids = network::get_active_network_pids().unwrap_or_default();
 
         let mut state = Self {
             store,
@@ -169,6 +201,7 @@ impl AppState {
             status: "Ready. Select an application to bypass VPN or block from internet.".into(),
             manager: Arc::new(Mutex::new(EnforcementManager::default())),
             watchdog_adapter: Arc::new(Mutex::new(selected_direct_if)),
+            watchdog_cache: Arc::new(Mutex::new(None)),
             config_load_failed,
             bypass_paused: false,
             app_status: HashMap::new(),
@@ -184,6 +217,10 @@ impl AppState {
             last_profile_retry: None,
             last_profile_retry_adapter: None,
         };
+
+        if state.config_load_failed {
+            state.status = "⚠ Config file could not be loaded (corrupt or written by a newer BiFlow); a preserved copy sits next to it as a .corrupt file. BiFlow started with default settings and saving is disabled for this session so nothing is overwritten.".into();
+        }
 
         state.auto_discover_network_apps();
 
@@ -214,7 +251,6 @@ impl AppState {
                 id: default_id,
                 name: "Default".into(),
                 enabled: true,
-                priority: 100,
                 rules: vec![],
                 adapter_index: None,
                 adapter_id: None,
@@ -260,48 +296,61 @@ impl AppState {
 
         // Reconcile firewall rules for blocked applications on startup:
         // firewall rules are persistent, so only apps whose rule is
-        // actually MISSING get re-created. (Previously every blocked app
-        // was deleted + re-added with several netsh/PowerShell spawns on
-        // the startup path, with a brief unblocked window in between.)
-        if crate::windows::privilege::is_elevated() {
-            for blocked_id in &state.store.blocked_apps {
-                let app = state.apps.iter().find(|a| a.id == *blocked_id);
-                // When the app (and therefore its executable) is known,
-                // reconcile against the VERIFIED block state: a rule that
-                // merely exists with this name but is disabled, allows, or
-                // targets another program does not block anything and must
-                // be recreated. Without a known executable only presence
-                // can be checked.
-                let state_check = match app {
-                    Some(app) => {
-                        crate::windows::firewall::query_verified_block(blocked_id, &app.executable)
-                    }
-                    None => crate::windows::firewall::query_rule_directions(blocked_id),
-                };
-                match state_check {
-                    Ok((true, true)) => continue,
-                    Ok(_) => {
-                        if let Some(app) = app {
-                            let _ = crate::windows::firewall::block_app(
-                                blocked_id,
-                                &app.name,
-                                &app.executable,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Unknown is not absent: leave the existing rules
-                        // alone instead of recreating (or assuming) them.
-                        config::append_log(&format!("FIREWALL_VERIFY_FAILED {} {}", blocked_id, e));
-                    }
-                }
-            }
-        }
+        // actually MISSING or unverified get re-created — decided from
+        // ONE batch query instead of per-app PowerShell spawns on the
+        // startup path.
+        let blocked_arg: Vec<(Uuid, Option<(String, String)>)> = state
+            .store
+            .blocked_apps
+            .iter()
+            .map(|bid| {
+                let app = state.apps.iter().find(|a| a.id == *bid);
+                (*bid, app.map(|a| (a.name.clone(), a.executable.clone())))
+            })
+            .collect();
+        crate::windows::firewall::reconcile_blocked_apps(&blocked_arg);
 
         state.refresh_app_status_cache();
         state.spawn_watchdog_thread();
 
         state
+    }
+
+    /// Load-time hygiene for the persisted store. The config file is
+    /// user-writable input (it lives in the user's data folder without an
+    /// ACL), so what comes back from disk is validated before the engine
+    /// trusts it: duplicate rules inside a profile are merged, rules
+    /// whose stored exe_path is not an absolute path are dropped (the
+    /// engine's only path check used to be "filename non-empty"), and
+    /// custom apps without a usable absolute executable are dropped.
+    /// Everything dropped is counted in one log line.
+    fn sanitize_store(store: &mut Store) {
+        let mut dropped = 0usize;
+        for profile in &mut store.profiles {
+            let mut seen: HashSet<(Uuid, Option<String>)> = HashSet::new();
+            profile.rules.retain(|r| {
+                if let Some(exe) = &r.exe_path {
+                    if !Path::new(exe).is_absolute() {
+                        dropped += 1;
+                        return false;
+                    }
+                }
+                seen.insert((
+                    r.app_id,
+                    r.exe_path.as_ref().map(|s| s.to_ascii_lowercase()),
+                ))
+            });
+        }
+        store.custom_apps.retain(|a| {
+            let ok = !a.executable.trim().is_empty() && Path::new(&a.executable).is_absolute();
+            if !ok {
+                dropped += 1;
+            }
+            ok
+        });
+        if dropped > 0 {
+            config::append_log(&format!("CONFIG_SANITIZED dropped_entries={}", dropped));
+        }
     }
 
     /// Background enforcement loop: process discovery, injection of newly
@@ -317,12 +366,23 @@ impl AppState {
     fn spawn_watchdog_thread(&self) {
         let manager = self.manager.clone();
         let adapter = self.watchdog_adapter.clone();
+        let cache = self.watchdog_cache.clone();
         let _ = std::thread::Builder::new()
             .name("biflow-watchdog".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
                 let maps = injector::get_process_maps();
                 let ifaces = network::interfaces().unwrap_or_default();
+                // Publish this cycle's snapshot for the UI tick, which no
+                // longer pays for these enumerations on the UI thread.
+                if let Ok(mut slot) = cache.lock() {
+                    *slot = Some(WatchdogCache {
+                        process_parents: maps.0.clone(),
+                        pid_to_path: maps.1.clone(),
+                        active_network_pids: network::get_active_network_pids(),
+                        interfaces: ifaces.clone(),
+                    });
+                }
                 let idx = *adapter.lock().unwrap_or_else(|e| e.into_inner());
                 // APIPA is not a usable direct address: an adapter with
                 // only a link-local address counts as "no adapter", so the
@@ -496,7 +556,6 @@ impl AppState {
                     executable: exe_path,
                     version: None,
                     source: "Active Network".into(),
-                    valid: true,
                 });
             }
         }
@@ -507,15 +566,45 @@ impl AppState {
     }
 
     pub fn update_running_cache(&mut self) {
-        let (_running_map, parents, paths) = injector::get_process_maps();
+        let (parents, paths) = injector::get_process_maps();
         self.process_parents = parents;
         self.pid_to_path = paths;
-        self.active_network_pids = network::get_active_network_pids();
+        // None = enumeration failed outright: keep the previous set
+        // instead of marking every app offline for one cycle.
+        if let Some(pids) = network::get_active_network_pids() {
+            self.active_network_pids = pids;
+        }
         if let Ok(ifaces) = network::interfaces() {
             self.interfaces = ifaces;
         }
         self.auto_discover_network_apps();
         self.refresh_app_status_cache();
+    }
+
+    /// Applies the watchdog thread's latest published snapshot. Cheap:
+    /// no process enumeration, no connection-table queries, no adapter
+    /// enumeration on the UI thread.
+    fn apply_watchdog_cache(&mut self) -> bool {
+        let snapshot = {
+            let Ok(mut slot) = self.watchdog_cache.lock() else {
+                return false;
+            };
+            slot.take()
+        };
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+        self.process_parents = snapshot.process_parents;
+        self.pid_to_path = snapshot.pid_to_path;
+        if let Some(pids) = snapshot.active_network_pids {
+            self.active_network_pids = pids;
+        }
+        if !snapshot.interfaces.is_empty() {
+            self.interfaces = snapshot.interfaces;
+        }
+        self.auto_discover_network_apps();
+        self.refresh_app_status_cache();
+        true
     }
 
     /// Recomputes the per-app (running, active-network) snapshot once per
@@ -657,7 +746,7 @@ impl AppState {
         }
 
         self.status = format!(
-            "Refreshed: {} applications ({} with active network), {} network adapters.",
+            "Refreshed: {} applications ({} processes with open connections), {} network adapters.",
             self.apps.len(),
             self.active_network_pids.len(),
             self.interfaces.len()
@@ -694,6 +783,36 @@ impl AppState {
             self.selected_app = Some(id);
             self.status = "Application added successfully.".into();
         }
+    }
+
+    /// Removes a user-added (custom) app. Adding one used to be a
+    /// one-way door: the entry lived in the persisted custom_apps list
+    /// forever and could only be removed by hand-editing the JSON. Only
+    /// the custom entry is removed; if the same executable is also
+    /// discovered normally it stays in the catalog as a discovered app.
+    pub fn remove_custom_app(&mut self, app_id: Uuid) {
+        let before = self.store.custom_apps.len();
+        self.store.custom_apps.retain(|a| a.id != app_id);
+        if self.store.custom_apps.len() == before {
+            return;
+        }
+        self.apps
+            .retain(|a| !(a.id == app_id && a.source == "Custom"));
+        if self.selected_app == Some(app_id) {
+            self.selected_app = None;
+        }
+        match self.save() {
+            Ok(()) => {
+                self.status = "Custom application removed.".into();
+            }
+            Err(e) => {
+                self.status = format!(
+                    "Custom application removed from the list, but the removal could not be saved: {}",
+                    e
+                );
+            }
+        }
+        self.refresh_app_status_cache();
     }
 
     pub fn is_app_blocked(&self, app_id: Uuid) -> bool {
@@ -735,10 +854,22 @@ impl AppState {
                 }
             }
         } else {
-            // If the app is currently bypassed, disable the bypass first
+            // If the app is currently bypassed, disable the bypass first.
+            // A failed removal aborts the block: blocking an app whose
+            // bypass stayed live (and not saying so) was the dishonest
+            // outcome this ordering exists to prevent.
             if self.manager().is_active(app_id) {
-                let _ = self.manager().remove(app_id);
-                let _ = self.update_active_profile_rule(app_id, false);
+                let remove_result = self.manager().remove(app_id);
+                if let Err(e) = remove_result {
+                    self.status = format!(
+                        "Failed to block {}: its bypass could not be disabled first ({})",
+                        app.name, e
+                    );
+                    return;
+                }
+                if let Err(e) = self.update_active_profile_rule(app_id, false) {
+                    config::append_log(&format!("BLOCK_PROFILE_RULE_SAVE_FAILED {} {}", app_id, e));
+                }
             }
 
             match crate::windows::firewall::block_app(&app_id, &app.name, &app.executable) {
@@ -848,18 +979,35 @@ impl AppState {
         // A failed save does not block the live switch; it is reported in
         // the status instead of being masked by a success message.
         let saved = self.save();
-        let _ = self.manager().clear_all();
+        let clear_note = match self.manager().clear_all() {
+            Ok(()) => String::new(),
+            Err(e) => format!(" Existing bypasses could not be cleared: {}", e),
+        };
         let _ = self.apply_active_profile_rules();
         self.recompute_paused();
         if let Some(iface) = self.interfaces.iter().find(|i| i.index == idx) {
+            // Selecting an adapter with no usable IPv4 is legal (the
+            // cable may come back), but the user must hear that bypasses
+            // cannot route through it yet — fail-close engages meanwhile.
+            let usable = iface
+                .ipv4
+                .as_deref()
+                .map(|ip| !network::is_apipa_ipv4(ip))
+                .unwrap_or(false);
+            let ip_note = if usable {
+                String::new()
+            } else {
+                " Warning: this adapter currently has no usable IPv4 address, so bypasses cannot route through it yet."
+                    .to_string()
+            };
             self.status = match saved {
                 Ok(()) => format!(
-                    "Direct network adapter set to '{}' for active profile.",
-                    iface.name
+                    "Direct network adapter set to '{}' for active profile.{}{}",
+                    iface.name, ip_note, clear_note
                 ),
                 Err(e) => format!(
-                    "Direct network adapter set to '{}', but the choice could not be saved: {}",
-                    iface.name, e
+                    "Direct network adapter set to '{}', but the choice could not be saved: {}{}{}",
+                    iface.name, e, ip_note, clear_note
                 ),
             };
         }
@@ -883,14 +1031,20 @@ impl AppState {
             p.rules = self.active_profile_baseline.clone();
         }
         let saved = self.save();
-        let _ = self.manager().clear_all();
+        let clear_note = match self.manager().clear_all() {
+            Ok(()) => String::new(),
+            Err(e) => format!(" Live bypasses could not be cleared: {}", e),
+        };
         let _ = self.apply_active_profile_rules();
         self.recompute_paused();
         self.status = match saved {
-            Ok(()) => "Reverted profile changes to last saved state.".into(),
+            Ok(()) => format!(
+                "Reverted profile changes to last saved state.{}",
+                clear_note
+            ),
             Err(e) => format!(
-                "Profile changes reverted in memory, but the revert could not be saved: {}",
-                e
+                "Profile changes reverted in memory, but the revert could not be saved: {}{}",
+                e, clear_note
             ),
         };
     }
@@ -1070,6 +1224,13 @@ impl AppState {
     /// stop it. On Err the reason is in self.status and the caller must
     /// keep the app running.
     pub fn exit_cleanup(&mut self) -> Result<(), String> {
+        // Persist session state (tray preferences, adapter choice) before
+        // teardown: toggling a tray checkbox marks the settings "pending"
+        // in the UI, and an exit must not silently drop it. A failed save
+        // must never block the exit cleanup itself.
+        if !self.config_load_failed {
+            let _ = config::save(&self.store);
+        }
         let mut errs: Vec<String> = Vec::new();
         if let Err(e) = self.manager().clear_all() {
             errs.push(e);
@@ -1111,8 +1272,18 @@ impl AppState {
     }
 
     pub fn switch_profile(&mut self, profile_id: Uuid) {
-        // 1. Clear active live bypass enforcement in memory without altering stored profile rules
-        let _ = self.manager().clear_all();
+        // 1. Clear active live bypass enforcement in memory without
+        // altering stored profile rules. A failed clear aborts the
+        // switch: proceeding would stack the new profile's rules on top
+        // of live bypasses the switch was supposed to replace.
+        let clear_result = self.manager().clear_all();
+        if let Err(e) = clear_result {
+            self.status = format!(
+                "Profile switch aborted: current bypasses could not be cleared ({})",
+                e
+            );
+            return;
+        }
 
         // 2. Set active profile. Switching to a profile is an explicit
         // activation, so a dormant profile wakes up here.
@@ -1156,16 +1327,24 @@ impl AppState {
         }
 
         // 4. Apply all enabled rules from the new active profile
-        let _ = self.apply_active_profile_rules();
+        let (_applied, failed) = self.apply_active_profile_rules();
         self.recompute_paused();
 
         if let Some(p) = self.store.profiles.iter().find(|x| x.id == profile_id) {
             let active_count = p.rules.iter().filter(|r| r.enabled).count();
+            let fail_note = if failed > 0 {
+                format!(" ({} rule(s) failed to apply)", failed)
+            } else {
+                String::new()
+            };
             self.status = match saved {
-                Ok(()) => format!("Activated profile '{}' ({} rules active).", p.name, active_count),
+                Ok(()) => format!(
+                    "Activated profile '{}' ({} rules active){}.",
+                    p.name, active_count, fail_note
+                ),
                 Err(e) => format!(
-                    "Activated profile '{}' ({} rules active), but the switch could not be saved: {}",
-                    p.name, active_count, e
+                    "Activated profile '{}' ({} rules active){}, but the switch could not be saved: {}",
+                    p.name, active_count, fail_note, e
                 ),
             };
         }
@@ -1221,7 +1400,6 @@ impl AppState {
             id: new_id,
             name: name.clone(),
             enabled: true,
-            priority: 100,
             rules: rules.clone(),
             adapter_index: self.selected_direct_if,
             adapter_id,
@@ -1234,21 +1412,28 @@ impl AppState {
             self.active_profile_baseline = rules;
         }
 
-        let _ = self.manager().clear_all();
+        let clear_note = match self.manager().clear_all() {
+            Ok(()) => String::new(),
+            Err(e) => format!(" Previous bypasses could not be cleared: {}", e),
+        };
         let _ = self.apply_active_profile_rules();
         self.recompute_paused();
 
         self.status = match saved {
-            Ok(()) => format!("Created and activated profile '{}'.", name),
+            Ok(()) => format!("Created and activated profile '{}'.{}", name, clear_note),
             Err(e) => format!(
-                "Created and activated profile '{}', but it could not be saved: {}",
-                name, e
+                "Created and activated profile '{}', but it could not be saved: {}{}",
+                name, e, clear_note
             ),
         };
         new_id
     }
 
-    pub fn delete_profile(&mut self, profile_id: Uuid) -> Result<(), String> {
+    /// Deletes a profile. On success returns the full user-facing
+    /// message, including which profile became active when the deleted
+    /// one was active — the caller shows exactly what happened instead
+    /// of a bare "deleted" that hides the forced activation.
+    pub fn delete_profile(&mut self, profile_id: Uuid) -> Result<String, String> {
         if self.store.profiles.len() <= 1 {
             return Err("Cannot delete the only remaining profile.".into());
         }
@@ -1265,15 +1450,27 @@ impl AppState {
 
         if is_active {
             let next_id = self.store.profiles[0].id;
+            let next_name = self.store.profiles[0].name.clone();
             self.switch_profile(next_id);
-        } else if self.save().is_err() {
+            let msg = format!(
+                "✔ Profile '{}' deleted. '{}' is now the active profile.",
+                removed_name, next_name
+            );
+            self.status = msg.clone();
+            return Ok(msg);
+        }
+        if self.save().is_err() {
             // save() left the error in self.status; the deletion is live
             // but will not survive restart.
-            return Ok(());
+            return Err(format!(
+                "Profile '{}' was deleted but the change could not be saved.",
+                removed_name
+            ));
         }
 
-        self.status = format!("Deleted profile '{}'.", removed_name);
-        Ok(())
+        let msg = format!("✔ Profile '{}' deleted.", removed_name);
+        self.status = msg.clone();
+        Ok(msg)
     }
 
     pub fn duplicate_profile(&mut self, profile_id: Uuid) -> Option<Uuid> {
@@ -1289,7 +1486,6 @@ impl AppState {
             id: new_id,
             name: new_name.clone(),
             enabled: true,
-            priority: profile.priority,
             rules: profile.rules.clone(),
             adapter_index: profile.adapter_index,
             adapter_id: profile.adapter_id.clone(),
@@ -1363,7 +1559,67 @@ impl AppState {
             }
         }
         if self.store.active_profile == Some(profile_id) {
-            let _ = self.manager().remove(app_id);
+            let remove_result = self.manager().remove(app_id);
+            if let Err(e) = remove_result {
+                self.status = format!(
+                    "Rule removed from the profile, but the live bypass could not be stopped: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Enables/disables one rule of a profile from the rules view (the
+    /// engine honored a disabled rule's dormancy, but until now the only
+    /// way to produce one was hand-editing the JSON — there was no UI
+    /// control at all). For the active profile the live state follows:
+    /// disabling stops the bypass, enabling applies it.
+    pub fn set_rule_enabled(&mut self, profile_id: Uuid, app_id: Uuid, enabled: bool) {
+        let Some(p) = self.store.profiles.iter_mut().find(|p| p.id == profile_id) else {
+            return;
+        };
+        let Some(rule) = p.rules.iter_mut().find(|r| r.app_id == app_id) else {
+            return;
+        };
+        rule.enabled = enabled;
+        let rule_exe = rule.exe_path.clone();
+        let rules_snapshot = self
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| p.rules.clone());
+        if self.save().is_ok() && self.store.active_profile == Some(profile_id) {
+            if let Some(rules) = rules_snapshot {
+                self.active_profile_baseline = rules;
+            }
+        }
+        if self.store.active_profile != Some(profile_id) {
+            return;
+        }
+        if !enabled {
+            let remove_result = self.manager().remove(app_id);
+            if let Err(e) = remove_result {
+                self.status = format!(
+                    "Rule disabled in the profile, but the live bypass could not be stopped: {}",
+                    e
+                );
+            }
+        } else if let Some(direct) = self.direct_interface().cloned() {
+            let target_exe = self
+                .apps
+                .iter()
+                .find(|a| a.id == app_id)
+                .map(|a| PathBuf::from(&a.executable))
+                .or_else(|| rule_exe.as_ref().map(PathBuf::from));
+            if let Some(exe) = target_exe {
+                let apply_result = self.manager().apply(app_id, exe, &direct);
+                if let Err(e) = apply_result {
+                    self.status =
+                        format!("Rule enabled, but the bypass could not be applied: {}", e);
+                }
+            }
+            self.recompute_paused();
         }
     }
 
@@ -1443,6 +1699,7 @@ impl AppState {
 
         let mut applied = 0;
         let mut failed = 0;
+        let mut skipped = 0;
         for rule in rules {
             if rule.enabled {
                 let app = self.apps.iter().find(|a| a.id == rule.app_id).or_else(|| {
@@ -1462,13 +1719,31 @@ impl AppState {
                 } else {
                     None
                 };
-                if let Some((id, exe)) = target {
-                    match self.manager().apply(id, exe, &direct) {
+                match target {
+                    Some((id, exe)) => match self.manager().apply(id, exe, &direct) {
                         Ok(()) => applied += 1,
-                        Err(_) => failed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            config::append_log(&format!(
+                                "PROFILE_RULE_APPLY_FAILED app={} err={}",
+                                id, e
+                            ));
+                        }
+                    },
+                    None => {
+                        // No discovered app and no stored path: the rule
+                        // cannot be registered at all. It used to vanish
+                        // from every count, indistinguishable from success.
+                        skipped += 1;
                     }
                 }
             }
+        }
+        if failed > 0 || skipped > 0 {
+            config::append_log(&format!(
+                "PROFILE_APPLY applied={} failed={} skipped_no_path={}",
+                applied, failed, skipped
+            ));
         }
         (applied, failed)
     }
@@ -1479,7 +1754,11 @@ impl AppState {
     pub fn tick_watchdog(&mut self) {
         if self.last_watchdog.elapsed().as_millis() > 1500 {
             self.last_watchdog = Instant::now();
-            self.update_running_cache();
+            // Prefer the watchdog thread's snapshot; compute directly
+            // only when the thread has not published one yet.
+            if !self.apply_watchdog_cache() {
+                self.update_running_cache();
+            }
             self.maybe_retry_profile_apply();
         }
     }
