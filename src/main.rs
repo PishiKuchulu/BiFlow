@@ -172,6 +172,14 @@ struct BiFlowApp {
     pending_confirm: Option<PendingConfirm>,
     last_tray_tooltip: String,
     search_focus_requested: bool,
+    /// A heavy engine operation deferred by one frame: the click sets
+    /// it, the next frame paints the busy indicator, and the frame
+    /// after that executes it (at the top of update). Without this,
+    /// the click handler blocked the UI thread instantly and the
+    /// window froze with zero feedback — there was no busy state
+    /// anywhere in the app.
+    pending_op: Option<PendingOp>,
+    busy_frame_shown: bool,
 }
 
 /// Destructive actions that require an explicit confirmation click.
@@ -179,8 +187,18 @@ struct BiFlowApp {
 enum PendingConfirm {
     DeleteProfile(Uuid),
     RemoveRule(Uuid, Uuid),
+    RemoveCustomApp(Uuid),
     UnblockAll,
     SetVpnAdapter(u32, String),
+}
+
+/// Heavy operations executed via the one-frame-deferred busy pattern.
+#[derive(Clone, Copy)]
+enum PendingOp {
+    Refresh,
+    ToggleBypass(Uuid),
+    ToggleBlock(Uuid),
+    Launch(Uuid),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,6 +229,8 @@ impl BiFlowApp {
             pending_confirm: None,
             last_tray_tooltip: String::new(),
             search_focus_requested: false,
+            pending_op: None,
+            busy_frame_shown: false,
         }
     }
 
@@ -218,8 +238,14 @@ impl BiFlowApp {
         // Periodic repaint drives the watchdog and tray-state handling.
         ctx.request_repaint_after(Duration::from_millis(500));
 
+        // While a confirmation dialog is open, tray actions are NOT
+        // consumed: the take_* flags stay set and are handled after the
+        // dialog closes. Processing Exit/Disable behind the dialog
+        // would act on a decision the user has not made yet.
+        let dialog_open = self.pending_confirm.is_some();
+
         // 1. Handle Restore Request from Tray (fired immediately by Windows callback)
-        if windows::tray::take_restore_requested() {
+        if !dialog_open && windows::tray::take_restore_requested() {
             self.is_hidden = false;
             self.suppress_minimize_to_tray = true;
             windows::bring_window_to_front();
@@ -230,10 +256,10 @@ impl BiFlowApp {
         }
 
         // 2. Handle Disable All / Resume Requests from Tray
-        if windows::tray::take_disable_all_requested() {
+        if !dialog_open && windows::tray::take_disable_all_requested() {
             self.state.disable_all();
         }
-        if windows::tray::take_resume_requested() && self.state.bypasses_paused() {
+        if !dialog_open && windows::tray::take_resume_requested() && self.state.bypasses_paused() {
             self.state.resume_all();
         }
 
@@ -245,7 +271,7 @@ impl BiFlowApp {
         // A refused exit must become VISIBLE: the window comes back so
         // the user sees the reason in the status bar instead of an app
         // that silently refuses to die from the tray.
-        if windows::tray::take_exit_requested() {
+        if !dialog_open && windows::tray::take_exit_requested() {
             if self.state.exit_cleanup().is_ok() {
                 std::process::exit(0);
             }
@@ -270,6 +296,7 @@ impl BiFlowApp {
         if tooltip != self.last_tray_tooltip {
             if let Some(tray) = &self.tray {
                 tray.set_tooltip(&tooltip);
+                tray.set_menu_state(self.state.bypasses_paused(), active > 0);
             }
             self.last_tray_tooltip = tooltip;
         }
@@ -392,20 +419,28 @@ impl BiFlowApp {
                 });
 
             if self.state.has_unsaved_changes() {
-                ui.label(egui::RichText::new("● Modified").size(11.0).color(egui::Color32::from_rgb(251, 191, 36)));
+                ui.label(egui::RichText::new("● Modified").size(11.0).color(egui::Color32::from_rgb(251, 191, 36)))
+                    .on_hover_text("Changes apply immediately. 'Modified' normally appears only when saving to disk failed.");
                 if ui.small_button("💾 Save").on_hover_text("Save current changes to this profile").clicked() {
-                    self.state.save_current_bypasses_to_active_profile();
-                    self.save_notification = Some(format!("✔ Saved changes to profile '{}'.", active_p_name));
+                    self.save_notification =
+                        Some(match self.state.save_current_bypasses_to_active_profile() {
+                            Ok(msg) => format!("✔ {}", msg),
+                            Err(e) => format!("✖ {}", e),
+                        });
                 }
                 if ui.small_button("↩ Revert").on_hover_text("Revert changes to last saved state").clicked() {
-                    self.state.revert_active_profile();
-                    self.save_notification = Some(format!("✔ Reverted profile '{}'.", active_p_name));
+                    self.save_notification = Some(match self.state.revert_active_profile() {
+                        Ok(msg) => format!("✔ {}", msg),
+                        Err(e) => format!("✖ {}", e),
+                    });
                 }
             }
 
             if let Some(id) = switch_from_top_bar {
-                self.state.switch_profile(id);
-                self.save_notification = Some("✔ Switched active profile.".into());
+                self.save_notification = Some(match self.state.switch_profile(id) {
+                    Ok(msg) => format!("✔ {}", msg),
+                    Err(e) => format!("✖ {}", e),
+                });
             }
 
             // Right-aligned header actions
@@ -455,8 +490,9 @@ impl BiFlowApp {
                     .button("🔄 Refresh")
                     .on_hover_text("Scan for newly started apps and network adapters")
                     .clicked()
+                    && self.pending_op.is_none()
                 {
-                    self.state.refresh();
+                    self.pending_op = Some(PendingOp::Refresh);
                 }
 
                 let active_count = self.state.active_bypass_count();
@@ -520,7 +556,7 @@ impl BiFlowApp {
             .filter(|a| self.state.is_app_bypassed(a.id))
             .count();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             // Stat Card 1: Total
             ui.group(|ui| {
                 ui.set_min_width(140.0);
@@ -603,7 +639,7 @@ impl BiFlowApp {
         ui.add_space(2.0);
 
         // Search & Filter Toolbar
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("🔍").size(14.0));
             let search_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.state.search)
@@ -757,7 +793,7 @@ impl BiFlowApp {
                     rendered_rows += 1;
 
                     // App card container
-                    ui.group(|ui| {
+                    let row_group = ui.group(|ui| {
                         ui.horizontal(|ui| {
                             // Selection radio
                             let sel_resp =
@@ -874,7 +910,11 @@ impl BiFlowApp {
                                         ),
                                         None => (
                                             "⚡ BYPASS CONFIGURED",
-                                            egui::Color32::from_rgb(148, 163, 184),
+                                            // Same state text as Pending =
+                                            // same color. This arm used to
+                                            // render slate gray, inventing a
+                                            // third, undocumented state.
+                                            egui::Color32::from_rgb(251, 191, 36),
                                             "Saved in the active profile.".to_string(),
                                         ),
                                     };
@@ -1003,20 +1043,50 @@ impl BiFlowApp {
 
                         // A failed bypass shows its reason right here —
                         // not only inside a hover tooltip most users
-                        // never open.
+                        // never open. Every Failed row gets the line:
+                        // when the engine has no specific problem text,
+                        // the generic reason is shown inline instead of
+                        // nothing.
                         if live_status == Some(BypassLiveStatus::Failed) {
-                            if let Some(p) = &problem {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "⚠ {} (toggle the bypass off and on to retry)",
-                                        p
-                                    ))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(248, 113, 113)),
-                                );
-                            }
+                            let reason = problem.as_deref().unwrap_or(
+                                "DLL injection failed for the running process.",
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚠ {} (toggle the bypass off and on to retry)",
+                                    reason
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(248, 113, 113)),
+                            );
+                        }
+
+                        // Helper-process widening is security-relevant
+                        // scope: it gets a visible line, not only the
+                        // Live pill's hover text.
+                        if !helpers.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "↳ Also bypassing {} helper process(es) from the same install folder",
+                                    helpers.len()
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(148, 163, 184)),
+                            );
                         }
                     });
+                    // Selection used to be only a ~10 px glyph swap and
+                    // a title color change — nearly invisible. Outline
+                    // the whole card, the way the network cards paint
+                    // their state.
+                    if is_selected {
+                        ui.painter().rect_stroke(
+                            row_group.response.rect.expand(1.0),
+                            egui::CornerRadius::same(4),
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(56, 189, 248)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
                 }
 
                 // Empty state: a filtered-to-nothing list used to be a
@@ -1024,18 +1094,34 @@ impl BiFlowApp {
                 if rendered_rows == 0 {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("No applications match the current search / filters.")
-                                .size(14.0)
-                                .weak(),
-                        );
-                        ui.add_space(6.0);
-                        if ui.button("Clear search & filters").clicked() {
-                            self.state.search.clear();
-                            self.state.filter_running_only = false;
-                            self.state.filter_net_only = false;
-                            self.state.filter_bypassed_only = false;
-                            self.state.filter_blocked_only = false;
+                        if self.state.apps.is_empty() {
+                            // The catalog itself is empty: "no match"
+                            // would be a lie, and clearing filters
+                            // changes nothing. Name the real state.
+                            ui.label(
+                                egui::RichText::new("No applications have been discovered yet.")
+                                    .size(14.0)
+                                    .weak(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Use Refresh in the header, or add an .exe manually with Add Custom .exe.")
+                                    .size(12.0)
+                                    .weak(),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("No applications match the current search / filters.")
+                                    .size(14.0)
+                                    .weak(),
+                            );
+                            ui.add_space(6.0);
+                            if ui.button("Clear search & filters").clicked() {
+                                self.state.search.clear();
+                                self.state.filter_running_only = false;
+                                self.state.filter_net_only = false;
+                                self.state.filter_bypassed_only = false;
+                                self.state.filter_blocked_only = false;
+                            }
                         }
                     });
                 }
@@ -1044,19 +1130,22 @@ impl BiFlowApp {
                     self.state.selected_app = Some(id);
                 }
                 if let Some(id) = remove_custom_target {
-                    self.state.remove_custom_app(id);
+                    // Removal is destructive (stops a live bypass, drops
+                    // rules and any block): it goes through the same
+                    // confirmation as the other destructive actions.
+                    self.pending_confirm = Some(PendingConfirm::RemoveCustomApp(id));
                 }
-                if let Some(id) = block_toggle_target {
-                    self.state.selected_app = Some(id);
-                    self.state.toggle_block_internet(id);
-                }
-                if let Some(id) = toggle_target {
-                    self.state.selected_app = Some(id);
-                    self.state.toggle_bypass();
-                }
-                if let Some(id) = launch_target {
-                    self.state.selected_app = Some(id);
-                    self.state.launch_selected();
+                // Heavy row operations run through the deferred busy
+                // pattern (see pending_op): first click wins, the busy
+                // frame paints, then the operation executes.
+                if self.pending_op.is_none() {
+                    if let Some(id) = block_toggle_target {
+                        self.pending_op = Some(PendingOp::ToggleBlock(id));
+                    } else if let Some(id) = toggle_target {
+                        self.pending_op = Some(PendingOp::ToggleBypass(id));
+                    } else if let Some(id) = launch_target {
+                        self.pending_op = Some(PendingOp::Launch(id));
+                    }
                 }
             });
     }
@@ -1075,6 +1164,16 @@ impl BiFlowApp {
         let interfaces = self.state.interfaces.clone();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if interfaces.is_empty() {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new(
+                        "No network adapters were enumerated. Use Refresh in the header; if this persists, check the diagnostic log (Settings → System Information).",
+                    )
+                    .size(13.0)
+                    .weak(),
+                );
+            }
             for iface in &interfaces {
                 let is_vpn = network::is_likely_vpn(iface);
                 let is_selected = self.state.selected_direct_if == Some(iface.index);
@@ -1240,10 +1339,10 @@ impl BiFlowApp {
             if ui
                 .checkbox(
                     &mut autostart_val,
-                    "⚡ Start BiFlow automatically when Windows starts",
+                    "⚡ Start BiFlow automatically when you sign in to Windows",
                 )
                 .on_hover_text(
-                    "Automatically start BiFlow at Windows boot in the background to ensure your bypass rules stay active",
+                    "Automatically start BiFlow at Windows logon (a Task Scheduler logon task) in the background to ensure your bypass rules stay active",
                 )
                 .changed()
             {
@@ -1297,7 +1396,7 @@ impl BiFlowApp {
             }
 
             ui.add_space(6.0);
-            if ui.button("💾 Save Preferences").clicked() {
+            if ui.button("💾 Save All Settings").clicked() {
                 if self.state.save().is_err() {
                     // save() left the error in state.status; surface it.
                     self.save_notification = Some(format!("✖ {}", self.state.status.clone()));
@@ -1340,15 +1439,20 @@ impl BiFlowApp {
                 }
 
                 if ui.button("💾 Save Profile Changes").on_hover_text("Save current bypass rules & adapter into this active profile").clicked() {
-                    self.state.save_current_bypasses_to_active_profile();
-                    self.save_notification = Some(format!("✔ Saved changes to profile '{}'.", active_profile_name));
+                    self.save_notification =
+                        Some(match self.state.save_current_bypasses_to_active_profile() {
+                            Ok(msg) => format!("✔ {}", msg),
+                            Err(e) => format!("✖ {}", e),
+                        });
                 }
 
                 if self.state.has_unsaved_changes()
                     && ui.button("↩ Revert").on_hover_text("Discard changes and revert to last saved state").clicked()
                 {
-                    self.state.revert_active_profile();
-                    self.save_notification = Some(format!("✔ Reverted profile '{}'.", active_profile_name));
+                    self.save_notification = Some(match self.state.revert_active_profile() {
+                        Ok(msg) => format!("✔ {}", msg),
+                        Err(e) => format!("✖ {}", e),
+                    });
                 }
             });
 
@@ -1428,8 +1532,14 @@ impl BiFlowApp {
                     ui.horizontal(|ui| {
                         // Profile Name or Inline Rename
                         if self.editing_profile_id == Some(p.id) {
-                            ui.add(egui::TextEdit::singleline(&mut self.editing_profile_name).desired_width(150.0));
-                            if ui.button("✔ Save").clicked() {
+                            let name_resp = ui.add(egui::TextEdit::singleline(&mut self.editing_profile_name).desired_width(150.0));
+                            // Keyboard contract, matching the create
+                            // field above: Enter saves, Esc cancels.
+                            let enter_pressed = name_resp.has_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let esc_pressed = name_resp.has_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if ui.button("✔ Save").clicked() || enter_pressed {
                                 if self.editing_profile_name.trim().is_empty() {
                                     // An empty rename used to close the
                                     // editor with NO message at all.
@@ -1442,7 +1552,7 @@ impl BiFlowApp {
                                     self.editing_profile_id = None;
                                 }
                             }
-                            if ui.button("✖ Cancel").clicked() {
+                            if ui.button("✖ Cancel").clicked() || esc_pressed {
                                 self.editing_profile_id = None;
                             }
                         } else {
@@ -1551,16 +1661,31 @@ impl BiFlowApp {
             }
 
             if let Some(id) = switch_to {
-                self.state.switch_profile(id);
-                self.save_notification = Some("✔ Switched active profile.".into());
+                self.save_notification = Some(match self.state.switch_profile(id) {
+                    Ok(msg) => format!("✔ {}", msg),
+                    Err(e) => format!("✖ {}", e),
+                });
             }
             if let Some((id, new_name)) = rename_target {
-                self.state.rename_profile(id, new_name);
-                self.save_notification = Some("✔ Profile renamed.".into());
+                if self.state.rename_profile(id, new_name.clone()) {
+                    self.save_notification = Some("✔ Profile renamed.".into());
+                } else {
+                    self.save_notification =
+                        Some(format!("✖ {}", self.state.status.clone()));
+                    // Keep the editor open with the attempted name so
+                    // the user can fix it instead of retyping.
+                    self.editing_profile_id = Some(id);
+                    self.editing_profile_name = new_name;
+                }
             }
             if let Some(id) = duplicate_target {
-                self.state.duplicate_profile(id);
-                self.save_notification = Some("✔ Profile duplicated.".into());
+                let _ = self.state.duplicate_profile(id);
+                let status = self.state.status.clone();
+                self.save_notification = Some(if status.contains("could not be saved") {
+                    format!("✖ {}", status)
+                } else {
+                    format!("✔ {}", status)
+                });
             }
             if let Some(id) = delete_target {
                 self.pending_confirm = Some(PendingConfirm::DeleteProfile(id));
@@ -1569,12 +1694,11 @@ impl BiFlowApp {
                 self.pending_confirm = Some(PendingConfirm::RemoveRule(pid, aid));
             }
             if let Some((pid, aid, enabled)) = rule_toggle_target {
-                self.state.set_rule_enabled(pid, aid, enabled);
-                self.save_notification = Some(if enabled {
-                    "✔ Rule enabled.".into()
-                } else {
-                    "✔ Rule disabled.".into()
-                });
+                self.save_notification =
+                    Some(match self.state.set_rule_enabled(pid, aid, enabled) {
+                        Ok(msg) => format!("✔ {}", msg),
+                        Err(e) => format!("✖ {}", e),
+                    });
             }
         });
 
@@ -1610,7 +1734,9 @@ impl BiFlowApp {
                         .iter()
                         .find(|a| a.id == *bid)
                         .map(|a| format!("🚫 {} — {}", a.name, a.executable))
-                        .unwrap_or_else(|| format!("🚫 {}", bid));
+                        .unwrap_or_else(|| {
+                            format!("🚫 Unknown app (leftover entry {})", bid)
+                        });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(label).size(12.0));
                         if ui.small_button("✅ Unblock").clicked() {
@@ -1857,6 +1983,23 @@ impl BiFlowApp {
                     "✖ Remove",
                 )
             }
+            PendingConfirm::RemoveCustomApp(aid) => {
+                let app_name = self
+                    .state
+                    .apps
+                    .iter()
+                    .find(|a| a.id == *aid)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| "this app".into());
+                (
+                    "Remove custom app?",
+                    format!(
+                        "Remove the custom app entry for {}? Its live bypass is stopped, its profile rules are removed, and its firewall block (if any) is lifted. This does not uninstall the application itself.",
+                        app_name
+                    ),
+                    "✖ Remove",
+                )
+            }
             PendingConfirm::UnblockAll => (
                 "Unblock all applications?",
                 "Remove every BiFlow block rule from Windows Firewall? All currently blocked applications regain full internet access.".to_string(),
@@ -1873,31 +2016,45 @@ impl BiFlowApp {
         };
 
         let mut decision: Option<bool> = None;
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(body);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(confirm_label).color(egui::Color32::WHITE),
-                            )
-                            .fill(egui::Color32::from_rgb(190, 30, 45)),
+        // Keyboard contract: Esc cancels, Enter confirms (the dialog
+        // previously had neither).
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                decision = Some(false);
+            } else if i.key_pressed(egui::Key::Enter) {
+                decision = Some(true);
+            }
+        });
+        // A real modal: egui::Modal paints a backdrop that consumes all
+        // background input. The previous plain Window left every panel
+        // clickable behind it, and a second destructive click silently
+        // replaced the pending action.
+        let modal = egui::Modal::new(egui::Id::new("pending_confirm_modal")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading(title);
+            ui.add_space(4.0);
+            ui.label(body);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(confirm_label).color(egui::Color32::WHITE),
                         )
-                        .clicked()
-                    {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
+                        .fill(egui::Color32::from_rgb(190, 30, 45)),
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decision = Some(false);
+                }
             });
+        });
+        if modal.should_close() && decision.is_none() {
+            decision = Some(false);
+        }
 
         if let Some(ok) = decision {
             self.pending_confirm = None;
@@ -1910,8 +2067,20 @@ impl BiFlowApp {
                         });
                     }
                     PendingConfirm::RemoveRule(pid, aid) => {
-                        self.state.remove_rule_from_profile(pid, aid);
-                        self.save_notification = Some("✔ Rule removed from profile.".into());
+                        self.save_notification =
+                            Some(match self.state.remove_rule_from_profile(pid, aid) {
+                                Ok(msg) => format!("✔ {}", msg),
+                                Err(e) => format!("✖ {}", e),
+                            });
+                    }
+                    PendingConfirm::RemoveCustomApp(aid) => {
+                        let _ = self.state.remove_custom_app(aid);
+                        let status = self.state.status.clone();
+                        self.save_notification = Some(if status.contains("could not be saved") {
+                            format!("✖ {}", status)
+                        } else {
+                            format!("✔ {}", status)
+                        });
                     }
                     PendingConfirm::UnblockAll => {
                         self.save_notification = Some(match self.state.unblock_all_apps() {
@@ -1933,6 +2102,31 @@ impl BiFlowApp {
 
 impl eframe::App for BiFlowApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Execute a deferred heavy operation once its busy frame has
+        // actually been presented (busy_frame_shown is set during the
+        // render pass that painted the spinner). The window therefore
+        // shows "Working…" on screen while this call blocks, instead
+        // of freezing without a word.
+        if self.busy_frame_shown {
+            if let Some(op) = self.pending_op.take() {
+                self.busy_frame_shown = false;
+                match op {
+                    PendingOp::Refresh => self.state.refresh(),
+                    PendingOp::ToggleBypass(id) => {
+                        self.state.selected_app = Some(id);
+                        self.state.toggle_bypass();
+                    }
+                    PendingOp::ToggleBlock(id) => {
+                        self.state.toggle_block_internet(id);
+                    }
+                    PendingOp::Launch(id) => {
+                        self.state.selected_app = Some(id);
+                        self.state.launch_selected();
+                    }
+                }
+            }
+        }
+
         // Handle Tray & Window state
         self.check_tray_and_window_state(ctx);
 
@@ -1968,6 +2162,22 @@ impl eframe::App for BiFlowApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Busy strip for a deferred heavy operation (see pending_op):
+            // painting this frame marks the operation armed; it executes
+            // at the top of the NEXT update, with this strip on screen.
+            if self.pending_op.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Working…")
+                            .strong()
+                            .color(egui::Color32::from_rgb(56, 189, 248)),
+                    );
+                });
+                ui.add_space(4.0);
+                self.busy_frame_shown = true;
+                ctx.request_repaint();
+            }
             // Global action-result banner: visible on every tab, colored
             // by outcome (an error must not render green), dismissed only
             // by the user. It used to exist only inside the Settings tab.
