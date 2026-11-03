@@ -239,6 +239,12 @@ pub fn set_autostart(enable: bool) -> Result<(), String> {
         let xml_dir = crate::windows::injector::biflow_programdata_dir()
             .ok_or_else(|| "ProgramData environment variable is unavailable".to_string())?;
         let xml_path = xml_dir.join("biflow_autostart_task.xml");
+        // Prove the containing folder's protection BEFORE publishing
+        // into it (policy publishing re-proves it on every write): if
+        // the root ACL application had failed, the XML would otherwise
+        // sit in a possibly user-writable folder between the rename
+        // below and its own per-file ACL.
+        crate::windows::injector::apply_protected_acl(&xml_dir)?;
         // schtasks /XML expects a UTF-16LE file. It is published via a
         // temp file + rename so a crash mid-write cannot leave a torn
         // XML (containing the exe path and the user's SID) behind.
