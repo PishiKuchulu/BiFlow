@@ -38,9 +38,13 @@ pub struct ActiveBypass {
 /// when the hook DLL is not actually inside the target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassLiveStatus {
-    /// Hook DLL is injected into at least one live process AND the DLL
-    /// itself reported all of its Winsock hooks installed.
+    /// Hook DLL is injected into every known live process of the app,
+    /// with no recorded injection failure.
     Live,
+    /// Hook DLL is injected into at least one live process, but
+    /// injection failed for at least one other process of the same app:
+    /// only the hooked processes bypass.
+    Partial,
     /// App is not running; the watchdog will inject when it starts.
     Pending,
     /// App is running but injection failed for every process.
@@ -120,15 +124,25 @@ impl EnforcementManager {
                 }
                 let mut paths: Vec<String> = set.iter().cloned().collect();
                 paths.sort();
-                injector::update_bypass_app_list(&paths)?;
-                injector::update_target_ip(ip)?;
-                self.published_allow = set.iter().map(|s| s.to_ascii_lowercase()).collect();
-                Ok(())
+                // No `?` inside these arms (AUD-002): this match is a
+                // plain expression, not a closure, so `?` would return
+                // from sync_policy_files itself and skip the
+                // last_policy_error bookkeeping below — the latch would
+                // never be set on exactly the failures it exists for.
+                // Capture the result instead and let it flow through.
+                let r = injector::update_bypass_app_list(&paths)
+                    .and_then(|()| injector::update_target_ip(ip));
+                if r.is_ok() {
+                    self.published_allow = set.iter().map(|s| s.to_ascii_lowercase()).collect();
+                }
+                r
             }
             _ => {
-                injector::clear_target_ip()?;
-                self.published_allow.clear();
-                Ok(())
+                let r = injector::clear_target_ip();
+                if r.is_ok() {
+                    self.published_allow.clear();
+                }
+                r
             }
         };
         // A failed publish is remembered until the next successful one:
@@ -181,6 +195,7 @@ impl EnforcementManager {
         let mut injected_pids: HashMap<u32, u64> = HashMap::new();
         let mut awaiting_process = false;
         let mut inject_error: Option<String> = None;
+        let mut partial_error: Option<String> = None;
 
         {
             // Match by full executable path so same-name binaries in other
@@ -189,6 +204,7 @@ impl EnforcementManager {
             if pids.is_empty() {
                 awaiting_process = true;
             } else {
+                let total_pids = pids.len();
                 let mut last_err: Option<String> = None;
                 for pid in pids {
                     match injector::inject_dll_into_pid(pid, &dll_path) {
@@ -206,13 +222,21 @@ impl EnforcementManager {
                 } else if let Some(e) = &last_err {
                     // Partial injection is real information: some PIDs of
                     // this app are hooked, others are not. It used to
-                    // vanish (only total failure was recorded anywhere).
+                    // vanish (only total failure was recorded anywhere);
+                    // now it is also recorded on the entry itself, so the
+                    // derived status is Partial instead of a blanket Live
+                    // (AUD-004).
+                    let failed = total_pids - injected_pids.len();
                     config::append_log(&format!(
                         "INJECT_PARTIAL app={} exe={} ok={} err={}",
                         app_id,
                         exe.display(),
                         injected_pids.len(),
                         e
+                    ));
+                    partial_error = Some(format!(
+                        "Injection failed for {} of {} processes: {}",
+                        failed, total_pids, e
                     ));
                 }
             }
@@ -227,7 +251,7 @@ impl EnforcementManager {
                 injected_pids,
                 helper_paths: HashSet::new(),
                 awaiting_process,
-                inject_error: inject_error.clone(),
+                inject_error: inject_error.clone().or(partial_error),
             },
         );
         // Publish the policy before claiming success. On failure, roll the
@@ -419,7 +443,14 @@ impl EnforcementManager {
     /// and live_status_map used to carry verbatim copies of this logic).
     fn derive_live_status(b: &ActiveBypass) -> BypassLiveStatus {
         if !b.injected_pids.is_empty() {
-            BypassLiveStatus::Live
+            // Hooked somewhere, but a recorded injection failure for
+            // another process of the same app must not render as full
+            // success (AUD-004).
+            if b.inject_error.is_some() {
+                BypassLiveStatus::Partial
+            } else {
+                BypassLiveStatus::Live
+            }
         } else if b.awaiting_process {
             BypassLiveStatus::Pending
         } else {
@@ -660,7 +691,11 @@ impl EnforcementManager {
                 }
             } else {
                 bypass.awaiting_process = false;
-                bypass.inject_error = None;
+                // A PID that failed injection THIS cycle keeps the entry
+                // Partial (AUD-004); when nothing failed, any stale
+                // partial note clears — the failing PID has exited or
+                // finally accepted the hook.
+                bypass.inject_error = errors.get(&entry.app_id).cloned();
             }
         }
 
@@ -743,8 +778,14 @@ mod tests {
         b.inject_error = Some("denied".into());
         assert_eq!(m.live_status(id), Some(BypassLiveStatus::Failed));
 
+        // Injected somewhere but a failure is still recorded for the
+        // entry: Partial, not Live (AUD-004).
         let b = m.active.get_mut(&id).unwrap();
         b.injected_pids.insert(1234, 42);
+        assert_eq!(m.live_status(id), Some(BypassLiveStatus::Partial));
+
+        let b = m.active.get_mut(&id).unwrap();
+        b.inject_error = None;
         assert_eq!(m.live_status(id), Some(BypassLiveStatus::Live));
     }
 
@@ -831,5 +872,28 @@ mod tests {
         let b = &m.active[&id];
         assert_eq!(b.injected_pids.len(), 2);
         assert_eq!(b.injected_pids.get(&222), Some(&7));
+    }
+
+    #[test]
+    fn watchdog_commit_keeps_partial_failure_visible() {
+        // AUD-004: one PID stays hooked while another refuses injection
+        // this cycle — the entry must derive Partial, not Live.
+        let mut m = EnforcementManager::default();
+        let id = Uuid::new_v4();
+        m.active.insert(id, entry(id, &[(111, 42)]));
+        let plan = vec![WatchdogPlanEntry {
+            app_id: id,
+            base_injected: [(111, 42)].into_iter().collect(),
+            pruned_injected: [(111, 42)].into_iter().collect(),
+            had_pids: true,
+            to_inject: vec![222],
+            helper_paths: vec![],
+        }];
+        let mut errors = HashMap::new();
+        errors.insert(id, "denied".to_string());
+        m.watchdog_commit(plan, &HashMap::new(), &errors, Some("192.168.1.10"));
+        let b = &m.active[&id];
+        assert_eq!(b.injected_pids.len(), 1);
+        assert_eq!(m.live_status(id), Some(BypassLiveStatus::Partial));
     }
 }
