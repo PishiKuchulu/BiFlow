@@ -370,6 +370,40 @@ impl AppState {
     /// (lock). UI status reads therefore never queue behind a remote-thread
     /// or hook-status wait.
     fn spawn_watchdog_thread(&self) {
+        /// Consecutive enumeration failures tolerated on the cached
+        /// adapter list before the cache stops vouching for the adapter
+        /// (AUD-006). At the watchdog's ~1.5 s cadence the bound is
+        /// roughly 6–10 s of blindness; beyond it the adapter's state is
+        /// honestly "unknown" and the commit's fail-close policy
+        /// decides, instead of a stale sample keeping a dead adapter
+        /// "present" indefinitely.
+        const MAX_ADAPTER_ENUM_FAILURES: u32 = 4;
+
+        /// One adapter enumeration with a bounded last-good fallback:
+        /// a transient failure reuses the previous list (a healthy
+        /// adapter must not read as "lost"), but only up to
+        /// MAX_ADAPTER_ENUM_FAILURES in a row.
+        fn sample_interfaces(
+            last_good: &mut Vec<InterfaceInfo>,
+            fail_streak: &mut u32,
+        ) -> Vec<InterfaceInfo> {
+            match network::interfaces() {
+                Ok(list) if !list.is_empty() => {
+                    *last_good = list.clone();
+                    *fail_streak = 0;
+                    list
+                }
+                _ => {
+                    *fail_streak = fail_streak.saturating_add(1);
+                    if *fail_streak > MAX_ADAPTER_ENUM_FAILURES {
+                        Vec::new()
+                    } else {
+                        last_good.clone()
+                    }
+                }
+            }
+        }
+
         let manager = self.manager.clone();
         let adapter = self.watchdog_adapter.clone();
         let cache = self.watchdog_cache.clone();
@@ -378,23 +412,29 @@ impl AppState {
             .name("biflow-watchdog".into())
             .spawn(move || {
                 // Last successfully enumerated adapter list, reused when
-                // an enumeration fails: two empty samples in a row used
-                // to read as "adapter lost" and trip the fail-close on a
-                // perfectly healthy adapter (round-2 completion audit).
+                // an enumeration fails — but only for a bounded number
+                // of consecutive failures (sample_interfaces, AUD-006):
+                // two empty samples in a row used to read as "adapter
+                // lost" and trip the fail-close on a perfectly healthy
+                // adapter (round-2 completion audit), while an unbounded
+                // cache would mask a real loss forever.
                 let mut last_good_ifaces: Vec<InterfaceInfo> = Vec::new();
+                let mut enum_fail_streak: u32 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1500));
                     if let Ok(mut b) = beat.lock() {
                         *b = Instant::now();
                     }
                     let maps = injector::get_process_maps();
-                    let ifaces = match network::interfaces() {
-                        Ok(list) if !list.is_empty() => {
-                            last_good_ifaces = list.clone();
-                            list
-                        }
-                        _ => last_good_ifaces.clone(),
-                    };
+                    let ifaces =
+                        sample_interfaces(&mut last_good_ifaces, &mut enum_fail_streak);
+                    if ifaces.is_empty()
+                        && enum_fail_streak == MAX_ADAPTER_ENUM_FAILURES + 1
+                    {
+                        config::append_log(
+                            "ADAPTER_ENUM_STALE_EXPIRED enumeration failing persistently; treating adapter state as unknown",
+                        );
+                    }
                     // Publish this cycle's snapshot for the UI tick, which no
                     // longer pays for these enumerations on the UI thread.
                     if let Ok(mut slot) = cache.lock() {
@@ -421,27 +461,47 @@ impl AppState {
                     if snapshot.entries.is_empty() {
                         continue;
                     }
-                    let dll_path = match injector::ensure_dll_extracted() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
-                            continue;
-                        }
-                    };
+                    // The plan needs no DLL: compute it first so the
+                    // commit below runs even when extraction fails
+                    // (AUD-003).
                     let plan = EnforcementManager::watchdog_plan(&snapshot, &maps);
                     let mut injected: HashMap<Uuid, Vec<(u32, u64)>> = HashMap::new();
                     let mut errors: HashMap<Uuid, String> = HashMap::new();
-                    for entry in &plan {
-                        for &pid in &entry.to_inject {
-                            match injector::inject_dll_into_pid(pid, &dll_path) {
-                                Ok(()) => {
-                                    injected.entry(entry.app_id).or_default().push((
-                                        pid,
-                                        injector::process_creation_time(pid).unwrap_or(0),
-                                    ));
+                    match injector::ensure_dll_extracted() {
+                        Ok(dll_path) => {
+                            for entry in &plan {
+                                for &pid in &entry.to_inject {
+                                    match injector::inject_dll_into_pid(pid, &dll_path) {
+                                        Ok(()) => {
+                                            injected.entry(entry.app_id).or_default().push((
+                                                pid,
+                                                injector::process_creation_time(pid)
+                                                    .unwrap_or(0),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            errors.insert(entry.app_id, e);
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    errors.insert(entry.app_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            // A broken extraction must not skip the
+                            // commit: adapter-loss fail-close and the
+                            // cycle's bookkeeping live there, and a
+                            // `continue` here left stale policy in place
+                            // for as long as the extraction kept failing.
+                            // Record the failure against every entry
+                            // awaiting injection and commit with no new
+                            // injections.
+                            config::append_log(&format!("WATCHDOG_DLL_ERROR {}", e));
+                            for entry in &plan {
+                                if !entry.to_inject.is_empty() {
+                                    errors.insert(
+                                        entry.app_id,
+                                        format!("Hook DLL unavailable: {}", e),
+                                    );
                                 }
                             }
                         }
@@ -455,6 +515,7 @@ impl AppState {
                     let ifaces_now = match network::interfaces() {
                         Ok(list) if !list.is_empty() => {
                             last_good_ifaces = list.clone();
+                            enum_fail_streak = 0;
                             list
                         }
                         _ => ifaces.clone(),
