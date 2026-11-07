@@ -876,7 +876,7 @@ impl BiFlowApp {
                                     // hook DLL is actually inside the target process.
                                     let (pill_text, pill_color, hover): (&str, egui::Color32, String) = match live_status {
                                         Some(BypassLiveStatus::Live) => {
-                                            let mut h = "Hook installed in the process (5/5 hooks reported). New connections are bound to the direct adapter; egress route is not verified — compare public IP to confirm.".to_string();
+                                            let mut h = "Hook DLL is loaded in every running process of this app. Connections from sockets the hook binds are routed via the direct adapter; sockets the app bound itself before the hook loaded keep their original route. Egress route is not verified — compare public IP to confirm.".to_string();
                                             if !helpers.is_empty() {
                                                 h.push_str(&format!(
                                                     "\nAlso bypassing {} helper process(es) from the same install folder: {}",
@@ -890,6 +890,24 @@ impl BiFlowApp {
                                             (
                                                 "⚡ BYPASSING VPN",
                                                 egui::Color32::from_rgb(52, 211, 153),
+                                                h,
+                                            )
+                                        }
+                                        Some(BypassLiveStatus::Partial) => {
+                                            let mut h = "Hook DLL is loaded in some processes of this app; injection failed for the others, so their connections keep the original route.".to_string();
+                                            if let Some(p) = &problem {
+                                                h.push_str(&format!("\n⚠ {}", p));
+                                            }
+                                            if !helpers.is_empty() {
+                                                h.push_str(&format!(
+                                                    "\nAlso bypassing {} helper process(es) from the same install folder: {}",
+                                                    helpers.len(),
+                                                    helpers.join(", ")
+                                                ));
+                                            }
+                                            (
+                                                "⚠ BYPASS PARTIAL",
+                                                egui::Color32::from_rgb(251, 191, 36),
                                                 h,
                                             )
                                         }
@@ -1041,23 +1059,31 @@ impl BiFlowApp {
                             );
                         });
 
-                        // A failed bypass shows its reason right here —
-                        // not only inside a hover tooltip most users
-                        // never open. Every Failed row gets the line:
-                        // when the engine has no specific problem text,
-                        // the generic reason is shown inline instead of
-                        // nothing.
-                        if live_status == Some(BypassLiveStatus::Failed) {
+                        // A failed or partial bypass shows its reason
+                        // right here — not only inside a hover tooltip
+                        // most users never open. When the engine has no
+                        // specific problem text, the generic reason is
+                        // shown inline instead of nothing.
+                        if matches!(
+                            live_status,
+                            Some(BypassLiveStatus::Failed) | Some(BypassLiveStatus::Partial)
+                        ) {
                             let reason = problem.as_deref().unwrap_or(
                                 "DLL injection failed for the running process.",
                             );
+                            let reason_color =
+                                if live_status == Some(BypassLiveStatus::Failed) {
+                                    egui::Color32::from_rgb(248, 113, 113)
+                                } else {
+                                    egui::Color32::from_rgb(251, 191, 36)
+                                };
                             ui.label(
                                 egui::RichText::new(format!(
                                     "⚠ {} (toggle the bypass off and on to retry)",
                                     reason
                                 ))
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(248, 113, 113)),
+                                .color(reason_color),
                             );
                         }
 
