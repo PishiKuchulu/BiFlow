@@ -110,8 +110,16 @@ fn exe_dir_is_protected(exe: &std::path::Path) -> bool {
     let Some(dir) = canonical.parent() else {
         return false;
     };
-    // Fail closed on an unreadable DACL.
+    // The directory check alone is not enough (AUD-001): a file-specific
+    // ACL on the executable itself — or an untrusted owner, who can
+    // rewrite the DACL — would let a standard user replace the binary
+    // inside an otherwise protected folder, and the HighestAvailable
+    // logon task would run the replacement. Check the file as well as
+    // its folder; fail closed on an unreadable DACL for either.
     matches!(
+        crate::windows::injector::path_grants_untrusted_write(&canonical, &user_sid),
+        Some(false)
+    ) && matches!(
         crate::windows::injector::path_grants_untrusted_write(dir, &user_sid),
         Some(false)
     )
