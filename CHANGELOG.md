@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.3.5 — 2026-11-08
+
+Fix wave from a third-party forensic audit of v0.3.4 (revision
+c960905), verified line-by-line before fixing: all six findings
+confirmed (4 High / 2 Medium), zero fabricated. Four of the six were
+in code from the v0.3.3/v0.3.4 fix waves.
+
+- AUD-002 (High): policy-publish failures never reached the
+  `last_policy_error` latch — the `?` operators inside
+  sync_policy_files' match arms returned from the function itself,
+  skipping the bookkeeping below, so the UI could derive "Live" over
+  a stale on-disk policy with no warning. The publish result is now
+  captured through the match and always recorded.
+- AUD-003 (High): a hook-DLL extraction failure made the watchdog
+  `continue` before watchdog_commit — the only place adapter-loss
+  fail-close lives — so while extraction kept failing, adapter loss
+  was never processed and stale policy persisted. The plan is now
+  computed first and the commit always runs; the extraction failure
+  is recorded against the entries awaiting injection.
+- AUD-006 (Medium): the watchdog's last-good adapter fallback (added
+  in v0.3.4 so a transient enumeration failure cannot trip the
+  fail-close on a healthy adapter) was unbounded — a persistent
+  enumeration failure kept a stale adapter "present" forever. The
+  fallback is now capped at 4 consecutive failures; beyond that the
+  adapter state is treated as unknown and the fail-close policy
+  decides (logged as ADAPTER_ENUM_STALE_EXPIRED).
+- AUD-001 (High): the autostart gate evaluated only the executable's
+  parent directory ACL. The executable file's own ACL (and owner) are
+  now checked as well; either check failing or unreadable refuses
+  registration. Ancestor directories above the install folder are
+  not re-evaluated.
+- AUD-004 (High): a bypass with some processes hooked and others
+  refused rendered as a full green "BYPASSING VPN". There is now a
+  Partial status (amber "BYPASS PARTIAL" pill plus an inline reason
+  line): apply() records partial failures on the entry, and the
+  watchdog commit keeps a cycle's injection failure attached to the
+  entry while any PID stays hooked. The Live hover text no longer
+  claims every new connection is bound — it now scopes the claim to
+  hook-bound sockets and keeps the egress caveat.
+- AUD-005 (Medium): the release job now also needs the MSRV job —
+  a tree that no longer builds on the declared Rust 1.90 does not
+  publish. cargo-audit is pinned to version 0.22.2 and stays
+  advisory under a documented exception in the workflow (the
+  advisory database changes daily; findings are reviewed per
+  release from the job log).
+
+Still unverified, as in every release so far: runtime behavior on a
+real Windows machine (injection, firewall readback, ACL effect,
+logon task). The audit's fault-injection regression tests (failing
+policy writer, forced extraction errors) remain future work — the
+fixes above are structural and covered by unit tests where a
+deterministic seam exists (Partial derivation and commit).
+
 ## v0.3.4 — 2026-11-03
 
 Fix wave from the round-2 granular audit of v0.3.3 (46 new findings:
